@@ -1,0 +1,47 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+
+# Build output
+dist/
+build/
+
+# Environment — NEVER commit secrets
+.env
+.env.local
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# ML model cache (large files)
+ml-service/.cache/
+ml-service/static/qrcodes/*.png
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker volumes (local only)
+mongo-data/
+redis-data/
+avatars-data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Zip files
+*.zip

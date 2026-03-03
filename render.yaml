@@ -1,0 +1,35 @@
+# render.yaml — Render.com deployment blueprint
+# Defines backend service configuration
+# Place this at: /backend/render.yaml  OR  root /render.yaml
+
+services:
+  - type: web
+    name: saioms-backend
+    runtime: node
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: node src/app.js
+    plan: free
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5000
+      # ─ Set these manually in Render dashboard ─
+      - key: MONGO_URI
+        sync: false          # fill in Render dashboard
+      - key: DB_NAME
+        value: saioms
+      - key: JWT_SECRET
+        sync: false          # generate a strong secret
+      - key: JWT_EXPIRES_IN
+        value: 7d
+      - key: ML_SERVICE_URL
+        sync: false          # HuggingFace Space URL
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: SERPAPI_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false          # your Vercel frontend URL
