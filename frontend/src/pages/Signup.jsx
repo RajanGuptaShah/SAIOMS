@@ -2,7 +2,8 @@ import { useState, useRef } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 
-const API = import.meta.env.VITE_API_URL || import.meta.env.VITE_API_BASE_URL || 'https://saioms-backend.onrender.com'
+const envUrl = import.meta.env.VITE_API_URL || import.meta.env.VITE_API_BASE_URL || 'https://saioms-backend.onrender.com'
+const API = envUrl.replace(/\/api\/?$/, '')
 
 /* ── Country codes ── */
 const COUNTRY_CODES = [
