@@ -1,19 +1,21 @@
 /**
  * SAIOMS — Animals Router (Express)
  *
- * POST   /api/animals/register          Register new animal + generate QR (auth required)
- * GET    /api/animals                   List MY animals (auth required)
- * GET    /api/animals/qr/:qr_id         Download QR image (proxy to ML service)
- * GET    /api/animals/by-qr/:qr_id      Full animal profile lookup by QR ID (public)
- * GET    /api/animals/:animal_id        Get single animal (public)
- * POST   /api/animals/decode-qr         Decode/verify a scanned QR string (public)
- * POST   /api/animals/transfer          Ownership transfer (auth required)
- * PUT    /api/animals/:animal_id/health  Update health / vaccination record (auth required)
+ * POST   /api/animals/register            Register new animal + generate QR (auth required)
+ * GET    /api/animals                     List MY animals (auth required)
+ * GET    /api/animals/qr/:qr_id           Download QR image (proxy to ML service)
+ * GET    /api/animals/by-qr/:qr_id        Full animal profile lookup by QR ID (public)
+ * GET    /api/animals/:animal_id          Get single animal (public)
+ * POST   /api/animals/decode-qr           Decode/verify a scanned QR string (public)
+ * POST   /api/animals/:id/regenerate-qr   Regenerate QR for existing animal (auth required)
+ * POST   /api/animals/transfer            Ownership transfer (auth required)
+ * PUT    /api/animals/:animal_id/health   Update health / vaccination record (auth required)
  */
 const express = require('express');
 const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
 const QRCode = require('qrcode');
+const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 
@@ -30,6 +32,45 @@ if (!fs.existsSync(QR_STATIC_DIR)) {
 }
 
 /**
+ * Native Node.js Fernet decryptor (AES-128-CBC + HMAC-SHA256).
+ * Matches the Python cryptography.fernet.Fernet implementation used by the ML service.
+ * Used as a LOCAL fallback so scanning works even when the ML service is down.
+ */
+function fernetDecryptLocal(encodedStr) {
+    try {
+        const secret = process.env.QR_SECRET || 'saioms-default-secret-change-in-production';
+        const salt = Buffer.from(process.env.QR_SALT || 'saioms-salt-2024');
+
+        // Derive 32-byte key using PBKDF2-HMAC-SHA256 (480000 iterations — matches Python)
+        const derivedKey = crypto.pbkdf2Sync(secret, salt, 480000, 32, 'sha256');
+        // Fernet key structure: first 16 bytes = HMAC signing key, last 16 bytes = AES-128 encryption key
+        const hmacKey = derivedKey.slice(0, 16);
+        const aesKey = derivedKey.slice(16, 32);
+
+        // Fernet token: base64url(version[1] + timestamp[8] + iv[16] + ciphertext[n] + hmac[32])
+        const tokenBuf = Buffer.from(encodedStr.replace(/_/g, '/').replace(/-/g, '+'), 'base64');
+        if (tokenBuf[0] !== 0x80) throw new Error('Bad Fernet version');
+
+        const iv = tokenBuf.slice(9, 25);
+        const ciphertext = tokenBuf.slice(25, tokenBuf.length - 32);
+        const hmacGiven = tokenBuf.slice(tokenBuf.length - 32);
+
+        // Verify HMAC over everything except the last 32 bytes
+        const hmacCalc = crypto.createHmac('sha256', hmacKey)
+            .update(tokenBuf.slice(0, tokenBuf.length - 32))
+            .digest();
+        if (!crypto.timingSafeEqual(hmacCalc, hmacGiven)) throw new Error('HMAC mismatch — tampered QR');
+
+        // Decrypt AES-128-CBC
+        const decipher = crypto.createDecipheriv('aes-128-cbc', aesKey, iv);
+        const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+        return JSON.parse(decrypted.toString('utf8'));
+    } catch (_) {
+        return null; // Not a valid Fernet token — caller tries other formats
+    }
+}
+
+/**
  * Generate QR locally using the `qrcode` npm package.
  * Returns { qr_id, qr_filename, qr_url }
  */
@@ -38,20 +79,14 @@ async function generateQRLocally(animalDoc) {
     const qr_filename = `${qr_id}.png`;
     const qr_path = path.join(QR_STATIC_DIR, qr_filename);
 
-    // Encode key animal info as JSON in the QR
-    const payload = JSON.stringify({
-        animal_id: animalDoc.animal_id,
-        qr_id,
-        owner: animalDoc.owner_name,
-        breed: animalDoc.breed,
-        species: animalDoc.species,
-    });
-
-    await QRCode.toFile(qr_path, payload, {
+    // Encode ONLY the qr_id UUID (36 chars) for a simple, fast-scanning QR
+    // All animal data is fetched from the DB at scan time using this ID
+    await QRCode.toFile(qr_path, qr_id, {
         type: 'png',
-        width: 300,
-        margin: 2,
-        color: { dark: '#1B4332', light: '#FFFFFF' },
+        width: 500,                                // Large output (500×500px)
+        margin: 4,                                 // 4-module quiet zone
+        errorCorrectionLevel: 'M',                 // Medium EC — good balance
+        color: { dark: '#000000', light: '#FFFFFF' }, // Pure black on white for max contrast
     });
 
     const port = process.env.PORT || 5000;
@@ -167,10 +202,15 @@ router.get('/qr/:qr_id', async (req, res, next) => {
             return res.status(404).json({ success: false, detail: 'QR not found' });
         }
 
+        // Determine disposition: ?download=1 forces attachment, otherwise inline for <img> display
+        const disposition = req.query.download === '1' ? 'attachment' : 'inline';
+        const dispHeader = `${disposition}; filename="saioms-qr-${req.params.qr_id.slice(0, 8)}.png"`;
+
         // 1. Try local static file first
         const localPath = path.join(QR_STATIC_DIR, animal.qr_path);
         if (fs.existsSync(localPath)) {
-            res.set('Content-Disposition', `attachment; filename="saioms-qr-${req.params.qr_id.slice(0, 8)}.png"`);
+            res.set('Content-Type', 'image/png');
+            res.set('Content-Disposition', dispHeader);
             return res.sendFile(localPath);
         }
 
@@ -179,7 +219,7 @@ router.get('/qr/:qr_id', async (req, res, next) => {
         try {
             const imgRes = await axios.get(imageUrl, { responseType: 'stream', timeout: 4000 });
             res.set('Content-Type', 'image/png');
-            res.set('Content-Disposition', `attachment; filename="saioms-qr-${req.params.qr_id.slice(0, 8)}.png"`);
+            res.set('Content-Disposition', dispHeader);
             imgRes.data.pipe(res);
         } catch {
             res.status(404).json({ success: false, detail: 'QR image not available' });
@@ -261,66 +301,100 @@ router.get('/:animal_id', async (req, res, next) => {
 router.post('/decode-qr', async (req, res, next) => {
     try {
         const { payload, qr_id } = req.body;
-
-        // Strategy 1: Direct DB lookup by qr_id (fast, for locally-generated or known QRs)
-        if (qr_id) {
-            const animal = await Animal.findOne({ $or: [{ qr_id }, { animal_id: qr_id }] }).lean();
-            if (animal) {
-                const { _id, __v, owner_user_id, ...rest } = animal;
-                return res.json({ success: true, animal: rest });
-            }
-        }
-
-        const rawPayload = payload || qr_id;
+        const rawPayload = (payload || qr_id || '').trim();
         if (!rawPayload) return res.status(400).json({ success: false, detail: 'No payload provided' });
 
-        // Strategy 2: Send to ML service for decryption (for Fernet-encrypted QR codes)
-        try {
-            const mlRes = await axios.post(`${ML_URL()}/api/qr/decode`, { payload: rawPayload }, { timeout: 6000 });
-            const decoded = mlRes.data;
+        const findAnimal = async (qId, aId) => {
+            const q = [];
+            if (qId) q.push({ qr_id: qId });
+            if (aId) q.push({ animal_id: aId });
+            if (!q.length) return null;
+            const doc = await Animal.findOne({ $or: q }).lean();
+            if (!doc) return null;
+            const { _id, __v, owner_user_id, ...rest } = doc;
+            return rest;
+        };
 
-            // ML service returns { success: true, data: { qr_id, animal_id, breed, owner_name, ... } }
-            const data = decoded.data || decoded;
-            const lookupQrId = data.qr_id;
-            const lookupAnimalId = data.animal_id;
-
-            // Now fetch the FULL animal record from DB using the decrypted IDs
-            if (lookupQrId || lookupAnimalId) {
-                const query = [];
-                if (lookupQrId) query.push({ qr_id: lookupQrId });
-                if (lookupAnimalId) query.push({ animal_id: lookupAnimalId });
-                const animal = await Animal.findOne({ $or: query }).lean();
-                if (animal) {
-                    const { _id, __v, owner_user_id, ...rest } = animal;
-                    return res.json({ success: true, animal: rest });
-                }
-            }
-
-            // If no DB record found but we have decrypted data, return what we have
-            return res.json({ success: true, animal: data });
-        } catch (mlErr) {
-            // ML service down — payload is probably not encrypted (plain JSON)
-            // Try to parse as JSON and do DB lookup
-            try {
-                const parsed = JSON.parse(rawPayload);
-                const qId = parsed.qr_id || parsed.qrId;
-                const aId = parsed.animal_id || parsed.animalId;
-                if (qId || aId) {
-                    const query = [];
-                    if (qId) query.push({ qr_id: qId });
-                    if (aId) query.push({ animal_id: aId });
-                    const animal = await Animal.findOne({ $or: query }).lean();
-                    if (animal) {
-                        const { _id, __v, owner_user_id, ...rest } = animal;
-                        return res.json({ success: true, animal: rest });
-                    }
-                }
-            } catch (_) { }
-            return res.status(503).json({ success: false, detail: 'QR decryption service unavailable. Please try again.' });
+        // ── Strategy 1: Plain UUID — new simplified QR codes (fast path) ──────
+        const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        if (uuidRe.test(rawPayload)) {
+            const animal = await findAnimal(rawPayload, rawPayload);
+            if (animal) return res.json({ success: true, animal });
         }
+
+        // ── Strategy 2: Direct DB lookup by passed qr_id field ───────────────
+        if (qr_id && qr_id !== rawPayload) {
+            const animal = await findAnimal(qr_id, qr_id);
+            if (animal) return res.json({ success: true, animal });
+        }
+
+        // ── Strategy 3: Local Fernet decrypt (NO ML service dependency) ───────
+        // This handles the old dense encrypted QR codes generated by the ML service.
+        const localDecrypted = fernetDecryptLocal(rawPayload);
+        if (localDecrypted) {
+            const animal = await findAnimal(localDecrypted.qr_id, localDecrypted.animal_id);
+            if (animal) return res.json({ success: true, animal });
+            // DB record missing — return the decrypted data directly
+            return res.json({ success: true, animal: localDecrypted });
+        }
+
+        // ── Strategy 4: Plain JSON payload (old backend-generated QRs) ────────
+        try {
+            const parsed = JSON.parse(rawPayload);
+            const qId = parsed.qr_id || parsed.qrId;
+            const aId = parsed.animal_id || parsed.animalId;
+            const animal = await findAnimal(qId, aId);
+            if (animal) return res.json({ success: true, animal });
+        } catch (_) { }
+
+        // ── Strategy 5: Forward to ML service as last resort ─────────────────
+        try {
+            const mlRes = await axios.post(`${ML_URL()}/api/qr/decode`, { payload: rawPayload }, { timeout: 5000 });
+            const data = mlRes.data?.data || mlRes.data;
+            const animal = await findAnimal(data.qr_id, data.animal_id);
+            if (animal) return res.json({ success: true, animal });
+            if (data.animal_id) return res.json({ success: true, animal: data });
+        } catch (_) { }
+
+        return res.status(404).json({ success: false, detail: 'No animal found for this QR code. It may be invalid or not registered in SAIOMS.' });
     } catch (err) {
         next(err);
     }
+});
+
+// ── POST /api/animals/:animal_id/regenerate-qr ───────────────────────────────
+// Regenerates a new simple QR for an existing animal (auth required)
+// Used to upgrade old dense QR codes to the new simple UUID-only format
+router.post('/:animal_id/regenerate-qr', protect, async (req, res, next) => {
+    try {
+        const animal = await Animal.findOne({ animal_id: req.params.animal_id });
+        if (!animal) return res.status(404).json({ success: false, detail: 'Animal not found' });
+
+        // Only owner can regenerate QR
+        if (animal.owner_user_id && animal.owner_user_id.toString() !== req.user._id.toString()) {
+            return res.status(403).json({ success: false, detail: 'You do not own this animal' });
+        }
+
+        // Try ML service first, fall back to local generation
+        let qr_id, qr_filename, qr_url;
+        try {
+            const qrRes = await axios.post(`${ML_URL()}/api/qr/generate`, { animal_doc: animal.toJSON() }, { timeout: 5000 });
+            qr_id = qrRes.data.qr_id;
+            qr_filename = qrRes.data.qr_filename;
+            qr_url = qrRes.data.qr_url;
+        } catch (_) {
+            const local = await generateQRLocally(animal);
+            qr_id = local.qr_id;
+            qr_filename = local.qr_filename;
+            qr_url = local.qr_url;
+        }
+
+        animal.qr_id = qr_id;
+        animal.qr_path = qr_filename;
+        await animal.save();
+
+        res.json({ success: true, message: 'QR code regenerated successfully', qr_id, qr_url });
+    } catch (err) { next(err); }
 });
 
 

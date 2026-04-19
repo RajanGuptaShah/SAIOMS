@@ -14,11 +14,35 @@ DB_NAME   = os.getenv("DB_NAME", "saioms")
 _client: Optional[AsyncIOMotorClient] = None
 
 
+import urllib.parse
+
+def _encode_mongo_uri(uri: str) -> str:
+    """
+    Re-encode username and password in a MongoDB URI so special characters
+    (@ ! # $ % etc.) don't break PyMongo's URI parser.
+    Safe to call even if the URI has no credentials (localhost).
+    """
+    try:
+        parsed = urllib.parse.urlparse(uri)
+        if parsed.username:
+            user = urllib.parse.quote_plus(parsed.username)
+            pwd  = urllib.parse.quote_plus(parsed.password or "")
+            # Rebuild netloc with encoded creds
+            host = parsed.hostname
+            port = f":{parsed.port}" if parsed.port else ""
+            netloc = f"{user}:{pwd}@{host}{port}"
+            uri = urllib.parse.urlunparse(parsed._replace(netloc=netloc))
+    except Exception:
+        pass  # If parsing fails, return original and let pymongo report the error
+    return uri
+
+
 def get_client() -> AsyncIOMotorClient:
     global _client
     if _client is None:
-        _client = AsyncIOMotorClient(MONGO_URI)
+        _client = AsyncIOMotorClient(_encode_mongo_uri(MONGO_URI))
     return _client
+
 
 
 def get_db():

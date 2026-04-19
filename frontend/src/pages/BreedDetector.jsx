@@ -123,28 +123,55 @@ export default function BreedDetector() {
     const startCamera = useCallback(async () => {
         setCamError(null); setResult(null); setError(null)
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({
-                video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }
-            }).catch(() =>
-                navigator.mediaDevices.getUserMedia({ video: true })
-            )
-            streamRef.current = stream
-            if (videoRef.current) {
-                videoRef.current.srcObject = stream
-                await new Promise(res => {
-                    if (videoRef.current.readyState >= 1) return res()
-                    videoRef.current.onloadedmetadata = res
+            let stream
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }
                 })
-                try { await videoRef.current.play() } catch (_) { }
+            } catch (_) {
+                try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } }) }
+                catch (__) { stream = await navigator.mediaDevices.getUserMedia({ video: true }) }
             }
+            streamRef.current = stream
+
+            // CRITICAL: set cameraActive FIRST so React renders the <video> element,
+            // then wait for the DOM commit before assigning srcObject
             setCameraActive(true)
-            setTimeout(() => setCaptureReady(true), 800)  // brief stabilize delay
+            await new Promise(r => setTimeout(r, 100))
+
+            const video = videoRef.current
+            if (!video) throw new Error('Camera view failed to initialize. Please try again.')
+
+            video.srcObject = stream
+            video.setAttribute('autoplay', '')
+            video.setAttribute('playsinline', '')
+            video.muted = true
+
+            await new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => {
+                    if (video.readyState >= 2) resolve()
+                    else reject(new Error('Camera started but no frames received. Please try again.'))
+                }, 5000)
+                const onPlaying = () => { clearTimeout(timeout); video.removeEventListener('playing', onPlaying); resolve() }
+                const onError = () => { clearTimeout(timeout); video.removeEventListener('error', onError); reject(new Error('Video stream error')) }
+                video.addEventListener('playing', onPlaying)
+                video.addEventListener('error', onError)
+                video.play().catch(err => { clearTimeout(timeout); reject(err) })
+            })
+
+            setTimeout(() => setCaptureReady(true), 800)  // brief stabilise delay
         } catch (err) {
-            setCamError(err.name === 'NotAllowedError'
-                ? 'Camera permission denied. Please allow camera access.'
-                : `Camera error: ${err.message}`)
+            if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null }
+            setCameraActive(false)
+            setCamError(
+                err.name === 'NotAllowedError' ? 'Camera permission denied. Please allow camera access in your browser settings.'
+                    : err.name === 'NotFoundError' ? 'No camera found on this device.'
+                        : err.name === 'NotReadableError' ? 'Camera is in use by another application.'
+                            : `Camera error: ${err.message}`
+            )
         }
     }, [])
+
 
     const captureAndDetect = useCallback(async () => {
         if (!videoRef.current || !canvasRef.current) return
@@ -450,11 +477,54 @@ export default function BreedDetector() {
                                                 </div>
 
                                                 <div className="detail-grid" style={{ marginBottom: 12 }}>
-                                                    <div className="detail-item"><div className="detail-key">Origin</div><div className="detail-val">{breedInfo.origin}</div></div>
-                                                    {breedInfo.milkYield && <div className="detail-item"><div className="detail-key">Milk Yield</div><div className="detail-val">{breedInfo.milkYield}</div></div>}
-                                                    {result.estimated_age && <div className="detail-item"><div className="detail-key">Est. Age</div><div className="detail-val">{result.estimated_age}</div></div>}
-                                                    <div className="detail-item"><div className="detail-key">Model</div><div className="detail-val" style={{ fontSize: 11 }}>{result.model_version}</div></div>
+                                                    <div className="detail-item">
+                                                        <div className="detail-key">Origin</div>
+                                                        <div className="detail-val">{result.origin || breedInfo.origin}</div>
+                                                    </div>
+                                                    {(result.milk_yield || breedInfo.milkYield) && (
+                                                        <div className="detail-item">
+                                                            <div className="detail-key">Milk Yield</div>
+                                                            <div className="detail-val">{result.milk_yield || breedInfo.milkYield}</div>
+                                                        </div>
+                                                    )}
+                                                    {/* ── DYNAMIC AGE — updated per image ── */}
+                                                    <div className="detail-item" style={{ gridColumn: 'span 2' }}>
+                                                        <div className="detail-key">Est. Age</div>
+                                                        <div className="detail-val">
+                                                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                                                                {/* Age category badge */}
+                                                                <span style={{
+                                                                    padding: '2px 10px', borderRadius: 999, fontWeight: 700, fontSize: 11,
+                                                                    background: result.age_category === 'calf' ? 'rgba(239,68,68,0.12)' :
+                                                                        result.age_category === 'young' ? 'rgba(245,158,11,0.12)' :
+                                                                            result.age_category === 'mature' ? 'rgba(107,114,128,0.14)' :
+                                                                                'rgba(45,106,79,0.12)',
+                                                                    color: result.age_category === 'calf' ? '#DC2626' :
+                                                                        result.age_category === 'young' ? '#B45309' :
+                                                                            result.age_category === 'mature' ? '#4B5563' :
+                                                                                '#1B4332',
+                                                                }}>
+                                                                    {result.age_category === 'calf' ? '🐣 Calf' :
+                                                                        result.age_category === 'young' ? '🌱 Young' :
+                                                                            result.age_category === 'mature' ? '🏆 Mature' :
+                                                                                '🐄 Adult'}
+                                                                </span>
+                                                                <span style={{ fontSize: 12, color: '#374151' }}>{result.age_range || result.estimated_age || '—'}</span>
+                                                            </div>
+                                                            {/* AI reasoning for age */}
+                                                            {result.age_reasoning && (
+                                                                <div style={{ fontSize: 11, color: '#9CA3AF', marginTop: 4, fontStyle: 'italic' }}>
+                                                                    🔍 {result.age_reasoning}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    </div>
+                                                    <div className="detail-item">
+                                                        <div className="detail-key">Model</div>
+                                                        <div className="detail-val" style={{ fontSize: 11 }}>{result.model_version}</div>
+                                                    </div>
                                                 </div>
+
 
                                                 <div style={{ marginBottom: 12 }}>
                                                     <div style={{ fontWeight: 700, fontSize: 13, color: '#1B4332', marginBottom: 6 }}>Key Characteristics</div>

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { getAnimal, updateHealth, transferOwnership, lookupTransferUser, qrDownloadUrl, deleteAnimal } from '../services/api'
+import { getAnimal, updateHealth, transferOwnership, lookupTransferUser, qrImageUrl, qrDownloadUrl, deleteAnimal, regenerateQR } from '../services/api'
 
 // ── Styles ────────────────────────────────────────────────────────
 const S = {
@@ -90,6 +90,7 @@ export default function AnimalProfile() {
     const [msg, setMsg] = useState(null)
     const [delModal, setDelModal] = useState(false)
     const [delBusy, setDelBusy] = useState(false)
+    const [qrBusy, setQrBusy] = useState(false)
     const [vets, setVets] = useState([])
     const [vetsLoading, setVetsLoading] = useState(false)
 
@@ -177,6 +178,17 @@ export default function AnimalProfile() {
         catch (err) { showMsg('error', err.response?.data?.detail || 'Delete failed'); setDelModal(false); setDelBusy(false) }
     }
 
+    const handleRegenQR = async () => {
+        setQrBusy(true)
+        try {
+            await regenerateQR(id)
+            showMsg('success', '✅ New QR code generated! Refresh to see it.')
+            load()
+        } catch (err) {
+            showMsg('error', err.response?.data?.detail || 'QR regeneration failed')
+        } finally { setQrBusy(false) }
+    }
+
     // ── States ────────────────────────────────────────────────────
     if (loading) return (
         <div style={S.page}><div style={S.wrap}>
@@ -249,7 +261,7 @@ export default function AnimalProfile() {
                     </div>
                     <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0 }}>
                         {animal.qr_id && (
-                            <a href={qrDownloadUrl(animal.qr_id)} target="_blank" rel="noreferrer"
+                            <a href={qrImageUrl(animal.qr_id)} target="_blank" rel="noreferrer"
                                 style={{ padding: '8px 14px', border: '1.5px solid #E5E0D8', borderRadius: 10, background: '#fff', color: '#1B4332', fontWeight: 700, fontSize: 12, textDecoration: 'none' }}>
                                 📥 Download QR
                             </a>
@@ -357,7 +369,7 @@ export default function AnimalProfile() {
                                     {/* QR image */}
                                     <div style={{ flexShrink: 0, padding: 12, border: '2px solid #E5E0D8', borderRadius: 16, background: '#fff', boxShadow: '0 2px 10px rgba(0,0,0,0.06)' }}>
                                         <img
-                                            src={qrDownloadUrl(animal.qr_id)}
+                                            src={qrImageUrl(animal.qr_id)}
                                             alt="Animal QR Code"
                                             style={{ width: 180, height: 180, display: 'block', borderRadius: 6 }}
                                             onError={e => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'flex' }}
@@ -375,7 +387,7 @@ export default function AnimalProfile() {
                                         </p>
                                         <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
                                             <a
-                                                href={qrDownloadUrl(animal.qr_id)}
+                                                href={qrImageUrl(animal.qr_id)}
                                                 target="_blank"
                                                 rel="noreferrer"
                                                 style={{ padding: '9px 16px', border: '1.5px solid #E5E0D8', borderRadius: 10, background: '#fff', color: '#1B4332', fontWeight: 700, fontSize: 13, textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: 6 }}
@@ -389,6 +401,14 @@ export default function AnimalProfile() {
                                             >
                                                 📥 Download QR PNG
                                             </a>
+                                            <button
+                                                onClick={handleRegenQR}
+                                                disabled={qrBusy}
+                                                title="Regenerate a new simple QR code that scans faster"
+                                                style={{ padding: '9px 16px', border: '1.5px solid rgba(212,160,23,0.4)', borderRadius: 10, background: 'rgba(212,160,23,0.10)', color: '#92400e', fontWeight: 700, fontSize: 13, cursor: qrBusy ? 'wait' : 'pointer', fontFamily: 'inherit', display: 'inline-flex', alignItems: 'center', gap: 6 }}
+                                            >
+                                                {qrBusy ? '⏳ Generating…' : '🔄 Regenerate QR'}
+                                            </button>
                                         </div>
                                     </div>
                                 </div>

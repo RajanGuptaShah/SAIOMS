@@ -15,10 +15,10 @@ from services.breed_service import detect_breed, ALL_BREEDS, BREED_SPECIES, MODE
 
 # Model version string is set by breed_service at load time
 try:
-    from services.breed_service import _clip_model as _cm
-    _MODEL_VERSION = "clip-zero-shot-v2" if (_cm is not None) else "demo-heuristic-v2"
+    from services.breed_service import _hf_model as _hm
+    _MODEL_VERSION = "hf-ujjwal75-indian-bovine-v1" if (_hm is not None) else "demo-heuristic-v3"
 except Exception:
-    _MODEL_VERSION = "demo-heuristic-v2"
+    _MODEL_VERSION = "demo-heuristic-v3"
 
 router = APIRouter(prefix="/api/breed", tags=["Breed Detection"])
 

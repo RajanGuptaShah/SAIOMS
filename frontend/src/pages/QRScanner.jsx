@@ -406,6 +406,7 @@ export default function QRScanner() {
     const [selectedFile, setSelectedFile] = useState(null)
     const [filePreview, setFilePreview] = useState(null)
     const [camError, setCamError] = useState(null)
+    const [manualId, setManualId] = useState('')
 
     const videoRef = useRef(null)
     const canvasRef = useRef(null)
@@ -564,7 +565,7 @@ export default function QRScanner() {
         setError(null); setCamError(null); setResult(null)
         isDecodingRef.current = false
         try {
-            // Use safe cross-browser constraints — no focusMode/zoom (not supported on most browsers)
+            // Use safe cross-browser constraints
             const constraints = {
                 video: {
                     facingMode: { ideal: 'environment' },
@@ -576,28 +577,83 @@ export default function QRScanner() {
             try {
                 stream = await navigator.mediaDevices.getUserMedia(constraints)
             } catch (_) {
-                // Fallback: minimal constraints if advanced ones fail
-                stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+                try {
+                    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+                } catch (__) {
+                    stream = await navigator.mediaDevices.getUserMedia({ video: true })
+                }
             }
             streamRef.current = stream
-            if (videoRef.current) {
-                videoRef.current.srcObject = stream
-                // Wait for metadata so video dimensions are real before scanning
-                await new Promise(resolve => {
-                    if (videoRef.current.readyState >= 1) return resolve()
-                    videoRef.current.onloadedmetadata = resolve
-                })
-                try { await videoRef.current.play() } catch (_) { /* already playing or autoplay blocked */ }
-            }
+
+            // IMPORTANT: Set scanning=true FIRST so the <video> element renders in the DOM.
+            // The video element is conditionally rendered via {scanning && ...}, so videoRef
+            // is null until React re-renders with scanning=true.
             setScanning(true)
+
+            // Wait for React to commit the render so that videoRef.current exists
+            await new Promise(r => setTimeout(r, 100))
+
+            const video = videoRef.current
+            if (!video) {
+                throw new Error('Camera view failed to initialize. Please try again.')
+            }
+
+            video.srcObject = stream
+            video.setAttribute('autoplay', '')
+            video.setAttribute('playsinline', '')
+            video.muted = true
+
+            // Wait until actual video frames are being rendered
+            await new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => {
+                    if (video.readyState >= 2) resolve()
+                    else reject(new Error('Camera started but video frames not received. Please try again.'))
+                }, 5000)
+
+                const onPlaying = () => {
+                    clearTimeout(timeout)
+                    video.removeEventListener('playing', onPlaying)
+                    video.removeEventListener('error', onError)
+                    resolve()
+                }
+                const onError = () => {
+                    clearTimeout(timeout)
+                    video.removeEventListener('playing', onPlaying)
+                    video.removeEventListener('error', onError)
+                    reject(new Error('Video stream error'))
+                }
+                video.addEventListener('playing', onPlaying)
+                video.addEventListener('error', onError)
+
+                video.play().catch(() => {
+                    video.muted = true
+                    video.play().catch(playErr => {
+                        clearTimeout(timeout)
+                        video.removeEventListener('playing', onPlaying)
+                        video.removeEventListener('error', onError)
+                        reject(playErr)
+                    })
+                })
+            })
+
+            // Small delay to let the first frame paint
+            await new Promise(r => setTimeout(r, 200))
             rafRef.current = requestAnimationFrame(scanFrame)
         } catch (err) {
+            // If camera fails, stop everything cleanly
+            if (streamRef.current) {
+                streamRef.current.getTracks().forEach(t => t.stop())
+                streamRef.current = null
+            }
+            setScanning(false)
             setCamError(
                 err.name === 'NotAllowedError'
                     ? 'Camera permission denied. Please allow camera access in your browser settings.'
                     : err.name === 'NotFoundError'
                         ? 'No camera found on this device. Use File Upload mode instead.'
-                        : `Camera error: ${err.message}`
+                        : err.name === 'NotReadableError'
+                            ? 'Camera is being used by another application. Close other camera apps and try again.'
+                            : `Camera error: ${err.message}`
             )
         }
     }, [scanFrame])
@@ -646,7 +702,15 @@ export default function QRScanner() {
         setResult(null); setError(null); setCamError(null); setScanning(false)
         setVets([]); setVetsLoading(false); setTab('animal')
         setSelectedFile(null); setFilePreview(null)
+        setManualId('')
         isDecodingRef.current = false
+    }
+
+    const handleManualLookup = async (e) => {
+        e?.preventDefault()
+        const q = manualId.trim()
+        if (!q) return
+        await handleDecoded(q)
     }
 
     const handleLocationSearch = useCallback(async (city, state) => {
@@ -673,6 +737,7 @@ export default function QRScanner() {
                     <div style={{ display: 'flex', gap: 6, marginBottom: 22, padding: 5, background: '#fff', border: '1.5px solid #E5E0D8', borderRadius: 999, width: 'fit-content' }}>
                         <button onClick={() => { setMode('camera'); reset() }} style={{ padding: '7px 18px', border: 'none', borderRadius: 999, cursor: 'pointer', fontWeight: 700, fontSize: 13, fontFamily: 'inherit', background: mode === 'camera' ? '#D4A017' : 'transparent', color: mode === 'camera' ? '#1f2a1f' : '#6B7280', transition: 'all 0.2s' }}>📷 Camera Scan</button>
                         <button onClick={() => { setMode('upload'); reset() }} style={{ padding: '7px 18px', border: 'none', borderRadius: 999, cursor: 'pointer', fontWeight: 700, fontSize: 13, fontFamily: 'inherit', background: mode === 'upload' ? '#D4A017' : 'transparent', color: mode === 'upload' ? '#1f2a1f' : '#6B7280', transition: 'all 0.2s' }}>🖼 Upload Image</button>
+                        <button onClick={() => { setMode('manual'); reset() }} style={{ padding: '7px 18px', border: 'none', borderRadius: 999, cursor: 'pointer', fontWeight: 700, fontSize: 13, fontFamily: 'inherit', background: mode === 'manual' ? '#D4A017' : 'transparent', color: mode === 'manual' ? '#1f2a1f' : '#6B7280', transition: 'all 0.2s' }}>⌨️ Enter ID</button>
                     </div>
                 )}
 
@@ -899,9 +964,48 @@ export default function QRScanner() {
                             </div>
                         )}
 
+                        {/* ── Manual ID Entry Mode ── */}
+                        {mode === 'manual' && (
+                            <div style={{ background: '#fff', border: '1.5px solid #E5E0D8', borderRadius: 22, padding: '36px 28px', boxShadow: '0 4px 20px rgba(27,67,50,0.08)' }}>
+                                <div style={{ textAlign: 'center', marginBottom: 28 }}>
+                                    <div style={{ fontSize: 56, marginBottom: 12 }}>⌨️</div>
+                                    <h3 style={{ fontFamily: '"Playfair Display",serif', color: '#1B4332', marginBottom: 8, fontSize: 22 }}>Enter Animal ID</h3>
+                                    <p style={{ color: '#6B7280', fontSize: 14, maxWidth: '38ch', margin: '0 auto' }}>
+                                        Type the Animal ID or QR ID from the animal's profile page to look it up directly.
+                                    </p>
+                                </div>
+                                <form onSubmit={handleManualLookup} style={{ display: 'flex', flexDirection: 'column', gap: 14, maxWidth: 440, margin: '0 auto' }}>
+                                    <input
+                                        value={manualId}
+                                        onChange={e => setManualId(e.target.value)}
+                                        placeholder="e.g. COW-2024-001 or paste a UUID..."
+                                        autoFocus
+                                        style={{
+                                            padding: '13px 16px', border: '2px solid #E5E0D8', borderRadius: 12,
+                                            fontSize: 15, fontFamily: 'inherit', outline: 'none', background: '#FAFAF9',
+                                            transition: 'border-color 0.2s',
+                                        }}
+                                        onFocus={e => e.target.style.borderColor = '#D4A017'}
+                                        onBlur={e => e.target.style.borderColor = '#E5E0D8'}
+                                    />
+                                    <button
+                                        type="submit"
+                                        disabled={loading || !manualId.trim()}
+                                        style={{ padding: '13px 24px', border: 'none', borderRadius: 12, background: '#D4A017', color: '#1f2a1f', fontWeight: 800, fontSize: 15, cursor: loading ? 'wait' : 'pointer', fontFamily: 'inherit', opacity: !manualId.trim() ? 0.5 : 1 }}
+                                    >
+                                        {loading ? '🔍 Looking up…' : '🔍 Find Animal'}
+                                    </button>
+                                </form>
+                                <div style={{ marginTop: 24, padding: '12px 16px', background: 'rgba(212,160,23,0.08)', border: '1px solid rgba(212,160,23,0.25)', borderRadius: 12, fontSize: 13, color: '#78350f', maxWidth: 440, margin: '24px auto 0' }}>
+                                    <strong>💡 Tip:</strong> If camera scanning isn't working, go to the animal's profile page and click <strong>🔄 Regenerate QR</strong> to get a new simple QR code that scans instantly.
+                                </div>
+                            </div>
+                        )}
+
                         {error && (
                             <div style={{ marginTop: 14, padding: '12px 16px', background: 'rgba(220,38,38,0.08)', border: '1px solid rgba(220,38,38,0.20)', borderRadius: 12, color: '#991b1b', fontSize: 14, fontWeight: 600 }}>⚠️ {error}</div>
                         )}
+
 
                         {/* How it works */}
                         <div style={{ marginTop: 28 }}>

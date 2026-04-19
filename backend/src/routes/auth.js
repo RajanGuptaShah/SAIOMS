@@ -51,38 +51,43 @@ function signToken(userId) {
  */
 router.post('/register', authLimiter, upload.single('avatar'), validateRegister, async (req, res, next) => {
     try {
-        const { name, email, phone, password, bio, location, role } = req.body;
+        const { name, email, phone, countryCode, password, bio, location, role, otpToken } = req.body;
+
+        const phoneWithCode = countryCode ? `${countryCode}${phone.replace(/^\+/, '').replace(/^0/, '')}` : phone;
+
+        // ── Require OTP verification token ──────────────────────────────────
+        if (!otpToken) {
+            return res.status(400).json({ success: false, detail: 'Email OTP verification is required before creating an account.' });
+        }
+        const mongoose = require('mongoose');
+        const OtpDoc = mongoose.models.OtpDoc;
+        if (OtpDoc) {
+            const otpDoc = await OtpDoc.findOne({ email: email.toLowerCase().trim(), verified: true, token: otpToken });
+            if (!otpDoc || otpDoc.expiresAt < new Date()) {
+                return res.status(401).json({ success: false, detail: 'OTP verification expired or invalid. Please verify your email again.' });
+            }
+        }
 
         const existing = await User.findOne({ email: email.toLowerCase().trim() });
-        if (existing) {
-            return res.status(409).json({ success: false, detail: 'An account with this email already exists.' });
-        }
+        if (existing) return res.status(409).json({ success: false, detail: 'An account with this email already exists.' });
 
-        const existingPhone = await User.findOne({ phone: phone.trim() });
-        if (existingPhone) {
-            return res.status(409).json({ success: false, detail: 'An account with this phone number already exists.' });
-        }
+        const existingPhone = await User.findOne({ phone: phoneWithCode.trim() });
+        if (existingPhone) return res.status(409).json({ success: false, detail: 'An account with this phone number already exists.' });
 
-        const user = await User.create({ name, email, phone, password, bio: bio || '', location: location || '', role });
+        const user = await User.create({ name, email, phone: phoneWithCode, password, bio: bio || '', location: location || '', role });
 
-        // Process avatar if uploaded
         if (req.file) {
-            try {
-                const photoUrl = await saveAvatar(req.file.buffer, user._id.toString());
-                user.profilePhoto = photoUrl;
-                await user.save();
-            } catch (_) { /* avatar upload is non-blocking */ }
+            try { const photoUrl = await saveAvatar(req.file.buffer, user._id.toString()); user.profilePhoto = photoUrl; await user.save(); } catch (_) { }
         }
+
+        // Clean up OTP doc
+        if (OtpDoc) await OtpDoc.deleteOne({ email: email.toLowerCase().trim() });
 
         const token = signToken(user._id);
-        res.status(201).json({
-            success: true,
-            message: 'Account created successfully',
-            token,
-            user: user.toJSON(),
-        });
+        res.status(201).json({ success: true, message: 'Account created successfully', token, user: user.toJSON() });
     } catch (err) { next(err); }
 });
+
 
 // ── POST /api/auth/login ──────────────────────────────────────────────────────
 /**

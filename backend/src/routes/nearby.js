@@ -19,10 +19,10 @@ const NOM_UA = 'SAIOMS/2.0 (animal-management-system; contact@saioms.in)';
 const RADIUS_KM = 50;
 const MAX_RESULTS = 30;
 
-// ── LRU cache: up to 200 cities, 6h TTL ──────────────────────────────────────
+// ── LRU cache: up to 200 cities, 12h TTL ──────────────────────────────────────
 const cache = new LRUCache({
     max: 200,
-    ttl: 6 * 60 * 60 * 1000, // 6 hours
+    ttl: 12 * 60 * 60 * 1000, // 12 hours
 });
 
 // ── Haversine ─────────────────────────────────────────────────────────────────
@@ -123,16 +123,19 @@ async function serpApiSearch(city, state, lat, lon) {
 
 // ── Nominatim geocode ─────────────────────────────────────────────────────────
 async function geocode(city, state) {
-    const variants = [
-        `${city}, ${state}, India`,
-        `${city}, ${state}`,
-        `${city} India`,
-        `${city}`,
-    ].filter(Boolean);
-    for (const q of variants) {
+    // Try India first, then include Nepal for cross-border searches
+    const countryVariants = [
+        { q: `${city}, ${state}, India`, cc: 'in' },
+        { q: `${city}, ${state}`, cc: 'in,np' },
+        { q: `${city} India`, cc: 'in' },
+        { q: `${city} Nepal`, cc: 'np' },
+        { q: `${city}`, cc: 'in,np' },
+    ].filter(v => v.q.replace(/,/g, '').trim().length > 0);
+
+    for (const { q, cc } of countryVariants) {
         try {
             const r = await axios.get('https://nominatim.openstreetmap.org/search', {
-                params: { q, format: 'json', limit: 3, countrycodes: 'in', addressdetails: 1 },
+                params: { q, format: 'json', limit: 3, countrycodes: cc, addressdetails: 1 },
                 headers: { 'Accept-Language': 'en', 'User-Agent': NOM_UA },
                 timeout: 10000,
             });
@@ -142,15 +145,18 @@ async function geocode(city, state) {
                 return (pri[a.type] ?? 6) - (pri[b.type] ?? 6);
             });
             const loc = ranked[0];
+            const country = loc.address?.country_code?.toUpperCase();
             return {
                 lat: parseFloat(loc.lat),
                 lon: parseFloat(loc.lon),
-                label: [loc.address?.city || loc.address?.town || city, loc.address?.state || state].filter(Boolean).join(', '),
+                country: country || 'IN',
+                label: [loc.address?.city || loc.address?.town || city, loc.address?.state || state, country === 'NP' ? 'Nepal' : ''].filter(Boolean).join(', '),
             };
         } catch (_) { continue; }
     }
     throw new Error(`Could not geocode "${city}"`);
 }
+
 
 // ── Tier 2: Overpass (OSM tagged amenities) ───────────────────────────────────
 async function overpassSearch(lat, lon) {
@@ -199,13 +205,13 @@ async function overpassSearch(lat, lon) {
     return [];
 }
 
-// ── Tier 3: Nominatim keyword searches ────────────────────────────────────────
+// ── Tier 3: Nominatim keyword searches (REDUCED: 5 key queries) ───────────────
 const KEYWORD_GROUPS = [
-    ['veterinary hospital', 'vet'], ['animal hospital', 'vet'], ['veterinary clinic', 'vet'],
-    ['pashu chikitsa', 'vet'], ['pashudhan vibhag', 'vet'], ['government veterinary', 'vet'],
-    ['gaushala', 'gaushala'], ['goshala', 'gaushala'], ['gosadan', 'gaushala'],
-    ['NGO animal welfare', 'ngo'], ['SPCA', 'ngo'], ['People for Animals', 'ngo'],
-    ['animal shelter', 'shelter'], ['animal rescue', 'shelter'],
+    ['veterinary hospital', 'vet'],
+    ['pashu chikitsa', 'vet'],
+    ['gaushala', 'gaushala'],
+    ['NGO animal welfare', 'ngo'],
+    ['animal shelter', 'shelter'],
 ];
 
 async function nominatimKeywordSearch(kw, categoryHint, lat, lon, cityHint) {
@@ -233,20 +239,22 @@ async function nominatimKeywordSearch(kw, categoryHint, lat, lon, cityHint) {
 }
 
 // ── Tier 4: Gemini fallback ───────────────────────────────────────────────────
-async function callGeminiForNearby(city, state) {
+async function callGeminiForNearby(city, state, country = 'India') {
     try {
         const key = process.env.GEMINI_API_KEY;
         if (!key) return [];
         const statePart = state ? `, ${state}` : '';
-        const prompt = `List 8-10 well-known animal welfare services in or near ${city}${statePart}, India.
-Include veterinary hospitals, gaushalas, NGOs, and animal shelters.
-For each: name, address, phone (or null), description (1 line), category (vet/gaushala/ngo/shelter), website (or null).
-Return ONLY a valid JSON array, no markdown:
+        const countryLabel = country === 'NP' ? 'Nepal' : 'India';
+        const prompt = `List 12-15 well-known animal welfare services in or near ${city}${statePart}, ${countryLabel}.
+Include a mix of: veterinary hospitals/clinics, gaushalas (cow shelters), animal NGOs, and animal shelters.
+For each entry provide: name, address (with area/landmark), phone (or null), description (1 line), category (vet/gaushala/ngo/shelter), website (or null).
+Include small veterinary clinics, charitable gaushalas, SPCA offices, and breed-specific cattle farms.
+Return ONLY a valid JSON array, no markdown, no explanation:
 [{"name":"...","address":"...","phone":null,"description":"...","category":"vet","website":null}]`;
         const res = await axios.post(
             `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`,
-            { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.3, maxOutputTokens: 2000 } },
-            { timeout: 18000 }
+            { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.2, maxOutputTokens: 3000 } },
+            { timeout: 22000 }
         );
         const text = res.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
         const jsonMatch = text.match(/\[[\s\S]*\]/);
@@ -268,6 +276,7 @@ Return ONLY a valid JSON array, no markdown:
         return [];
     }
 }
+
 
 // ── Combine & deduplicate ─────────────────────────────────────────────────────
 function buildResult(item, cat) {
@@ -337,43 +346,67 @@ router.get('/', async (req, res, next) => {
             return res.json(payload);
         }
 
-        const { lat, lon, label } = geoResult;
-
-        // Run SerpAPI, Overpass, and Nominatim keyword searches in parallel
+        const { lat, lon, label, country } = geoResult;
         const cityHint = state ? `${city} ${state}` : city;
-        const [serpResults, overpassRaw, ...kwBatches] = await Promise.all([
-            serpApiSearch(city, state, lat, lon),
-            overpassSearch(lat, lon),
-            ...KEYWORD_GROUPS.map(([kw, cat]) =>
-                nominatimKeywordSearch(kw, cat, lat, lon, cityHint).then(arr => arr.map(r => ({ ...r, category: cat })))
-            ),
-        ]);
-
         const deduper = new DedupeSet();
         const combined = [];
 
-        // Priority: SerpAPI → Overpass → Nominatim
+        // ── Tier 1: SerpAPI (fast, commercial) ────────────────────────────────
+        let serpResults = [];
+        try {
+            serpResults = await serpApiSearch(city, state, lat, lon);
+        } catch (_) { }
+
         for (const item of serpResults) {
             if (!item.name || deduper.isDuplicate(item.name)) continue;
             combined.push(buildResult(item, item.category));
         }
-        for (const item of overpassRaw) {
-            if (!item.name || deduper.isDuplicate(item.name)) continue;
-            combined.push(buildResult(item, categorise(item.name, item.amenity, item.office)));
+
+        // Short-circuit: if SerpAPI already gave 10+ results, skip OSM tiers
+        if (combined.length >= 10) {
+            combined.sort((a, b) => a.dist - b.dist);
+            const topResults = combined.slice(0, MAX_RESULTS);
+            const payload = buildPayload(city, state, lat, lon, label, topResults, false);
+            cache.set(cacheKey, payload);
+            return res.json(payload);
         }
-        for (const batch of kwBatches) {
-            for (const item of batch) {
+
+        // ── Tier 2 & 3: OSM (Overpass + Nominatim) with 8s hard timeout ──────
+        const OSM_TIMEOUT = 8000;
+
+        const osmTask = (async () => {
+            const overpassRaw = await overpassSearch(lat, lon);
+            for (const item of overpassRaw) {
                 if (!item.name || deduper.isDuplicate(item.name)) continue;
-                combined.push(buildResult(item, item.category));
+                combined.push(buildResult(item, categorise(item.name, item.amenity, item.office)));
             }
-        }
+
+            if (combined.length >= 5) return;
+
+            const kwBatches = await Promise.all(
+                KEYWORD_GROUPS.map(([kw, cat]) =>
+                    nominatimKeywordSearch(kw, cat, lat, lon, cityHint)
+                        .then(arr => arr.map(r => ({ ...r, category: cat })))
+                )
+            );
+            for (const batch of kwBatches) {
+                for (const item of batch) {
+                    if (!item.name || deduper.isDuplicate(item.name)) continue;
+                    combined.push(buildResult(item, item.category));
+                }
+            }
+        })();
+
+        const timeoutPromise = new Promise(resolve => setTimeout(resolve, OSM_TIMEOUT));
+        await Promise.race([osmTask, timeoutPromise]);
 
         combined.sort((a, b) => a.dist - b.dist);
         let topResults = combined.slice(0, MAX_RESULTS);
 
-        // Gemini fallback if sparse
-        if (topResults.length < 3) {
-            const geminiResults = await callGeminiForNearby(city, state);
+        // ── Tier 4: Gemini — always call Gemini when results are sparse ───────
+        // Threshold: < 5 (was < 3) to ensure good coverage for all cities
+        if (topResults.length < 5) {
+            const geminiResults = await callGeminiForNearby(city, state, country);
             for (const gr of geminiResults) {
                 if (!deduper.isDuplicate(gr.name)) topResults.push(buildResult(gr, gr.category));
             }

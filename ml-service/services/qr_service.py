@@ -1,6 +1,10 @@
 """
 SAIOMS ML Service — QR Code Service
-Generates AES-256-Fernet encrypted QR codes for animal ownership records.
+Generates simple, fast-scanning QR codes for animal identity lookup.
+
+v2: Encodes ONLY the qr_id UUID (36 chars) in the QR code for maximum
+scannability (QR version 2, 25×25 modules). All animal data is fetched
+from the database at scan time using this ID as the lookup key.
 """
 from __future__ import annotations
 import os
@@ -9,12 +13,12 @@ import uuid
 import base64
 import qrcode
 from pathlib import Path
-from datetime import datetime
+from PIL import Image
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-# ── Key derivation ─────────────────────────────────────────────────────────────
+# ── Key derivation (kept for backward-compatible decoding of old QRs) ──────────
 _SECRET = os.getenv("QR_SECRET", "saioms-default-secret-change-in-production")
 _SALT   = os.getenv("QR_SALT",   "saioms-salt-2024").encode()
 
@@ -36,45 +40,37 @@ _CIPHER = _make_cipher()
 QR_DIR = Path(__file__).parent.parent / "static" / "qrcodes"
 QR_DIR.mkdir(parents=True, exist_ok=True)
 
+# ── QR image settings ─────────────────────────────────────────────────────────
+_QR_IMAGE_SIZE = 500          # Final output size in pixels (500×500)
+_QR_BOX_SIZE   = 20           # Large modules for easy scanning
+_QR_BORDER     = 4            # 4-module quiet zone (ISO standard)
+
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 def generate_qr(animal_doc: dict) -> tuple[str, str]:
     """
-    Generate an encrypted QR code for an animal document.
+    Generate a simple, fast-scanning QR code for an animal document.
+    Encodes only the qr_id UUID (36 chars) → QR version 2 (25×25 modules).
     Returns (qr_id, qr_filename).
     """
     qr_id = str(uuid.uuid4())
 
-    payload = {
-        "qr_id":         qr_id,
-        "animal_id":     animal_doc.get("animal_id"),
-        "owner_name":    animal_doc.get("owner_name"),
-        "owner_phone":   animal_doc.get("owner_phone"),
-        "district":      animal_doc.get("district"),
-        "state":         animal_doc.get("state"),
-        "species":       animal_doc.get("species"),
-        "breed":         animal_doc.get("breed"),
-        "gender":        animal_doc.get("gender"),
-        "dob":           animal_doc.get("dob"),
-        "health_status": animal_doc.get("health_status"),
-        "vaccinations":  animal_doc.get("vaccinations", []),
-        "generated_at":  datetime.utcnow().isoformat() + "Z",
-        "version":       "saioms-qr-v1",
-    }
-
-    encrypted_bytes = _CIPHER.encrypt(json.dumps(payload).encode())
-    encoded_str     = base64.urlsafe_b64encode(encrypted_bytes).decode()
-
+    # ── Build QR with minimal data for instant scanning ────────────────────
     qr = qrcode.QRCode(
-        version=None,
-        error_correction=qrcode.constants.ERROR_CORRECT_H,
-        box_size=10,
-        border=4,
+        version=2,                                    # Force low version (25×25)
+        error_correction=qrcode.constants.ERROR_CORRECT_M,  # Medium EC — good balance
+        box_size=_QR_BOX_SIZE,
+        border=_QR_BORDER,
     )
-    qr.add_data(encoded_str)
+    qr.add_data(qr_id)                               # Only 36-char UUID
     qr.make(fit=True)
 
-    img      = qr.make_image(fill_color="#1B4332", back_color="white")
+    # Pure black on white for maximum contrast (best for low-end cameras)
+    img = qr.make_image(fill_color="black", back_color="white")
+
+    # Resize to consistent 500×500px output
+    img = img.resize((_QR_IMAGE_SIZE, _QR_IMAGE_SIZE), Image.NEAREST)
+
     filename = f"{animal_doc.get('animal_id', 'unknown')}_{qr_id[:8]}.png"
     img.save(str(QR_DIR / filename))
 
@@ -82,7 +78,11 @@ def generate_qr(animal_doc: dict) -> tuple[str, str]:
 
 
 def decode_qr(encoded_str: str) -> dict:
-    """Decrypt and verify a QR payload string. Raises on tamper."""
+    """
+    Decrypt and verify an OLD encrypted QR payload string.
+    Kept for backward compatibility with v1 Fernet-encrypted QR codes.
+    Raises on tamper or if the string is not a valid encrypted payload.
+    """
     encrypted_bytes = base64.urlsafe_b64decode(encoded_str.encode())
     decrypted       = _CIPHER.decrypt(encrypted_bytes)
     return json.loads(decrypted.decode())

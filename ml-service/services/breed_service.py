@@ -1,321 +1,312 @@
 """
-SAIOMS ML Service — Breed Detection Service v2
-═══════════════════════════════════════════════════════════════════
-Enhancements over v1:
-  1. Image preprocessing pipeline: EXIF auto-rotate, CLAHE contrast
-     enhancement, smart resize with padding to 224×224
-  2. Ensemble secondary classifier: colour/texture heuristic blends
-     with CLIP scores when top confidence < 0.80
-  3. Expanded BREED_INFO with detection output details
-
-Architecture:
-  1. Preprocessing → normalise image quality
-  2. CLIP ViT-B/32 zero-shot → species gate + breed ranking
-  3. If conf < 0.80 → secondary heuristic blend (ensemble)
-  4. Fallback demo if CLIP unavailable
+SAIOMS ML Service — Indian Bovine Breed Detection v5
+═══════════════════════════════════════════════════════
+Primary:  ujjwal75/indian-bovine-breeds-model (HuggingFace)
+Fallback: Gemini Vision — real AI analysis including DYNAMIC AGE ESTIMATION
+Last resort: color-based deterministic heuristic
 """
 from __future__ import annotations
-
-import io
-import os
-import hashlib
-import random
-from pathlib import Path
-from typing import List, Optional
-
-from PIL import Image, ImageEnhance, ImageOps
+import io, os, base64, hashlib, random, json, re
+from typing import List
+from PIL import Image, ImageOps
 import numpy as np
 
-# ── Breed catalogue ───────────────────────────────────────────────────────────
-CATTLE_BREEDS = [
-    "Gir", "Sahiwal", "Red Sindhi", "Tharparkar", "Kankrej",
-    "Hariana", "Ongole", "Khillari", "Hallikar", "Rathi",
-    "Deoni", "Malnad Gidda", "Amrit Mahal", "Kangayam", "Krishna Valley",
-]
+# ── Breed metadata (origin, milk yield, key traits) ─────────────────────────
 BUFFALO_BREEDS = [
-    "Murrah", "Jaffarabadi", "Surti", "Mehsana",
-    "Nili-Ravi", "Bhadawari", "Pandharpuri", "Nagpuri",
-    "Chilika", "Toda",
+    "Banni","Bhadawari","Chilika","Jaffarabadi","Jaffrabadi","Mehsana",
+    "Murrah","Nagpuri","Nili Ravi","Pandharpuri","Surti","Toda"
 ]
-ALL_BREEDS  = CATTLE_BREEDS + BUFFALO_BREEDS
-NUM_CLASSES = len(ALL_BREEDS)
-
-BREED_SPECIES = {b: "cattle" for b in CATTLE_BREEDS}
-BREED_SPECIES.update({b: "buffalo" for b in BUFFALO_BREEDS})
 
 BREED_META = {
-    "Gir":           ("4–6 yrs", "3.2/5", "High milk production, heat-tolerant Zebu from Gujarat"),
-    "Sahiwal":       ("3–5 yrs", "3.0/5", "Premier Indian dairy breed, tick-resistant, high milk fat"),
-    "Red Sindhi":    ("2–4 yrs", "2.9/5", "Smallholder dairy breed, very disease-resistant"),
-    "Tharparkar":    ("4–6 yrs", "3.1/5", "Dual-purpose arid-zone cattle from Rajasthan"),
-    "Kankrej":       ("5–7 yrs", "3.3/5", "Draught and dairy dual breed from Gujarat"),
-    "Hariana":       ("4–7 yrs", "3.0/5", "Draught breed of Haryana, lean and strong"),
-    "Ongole":        ("5–8 yrs", "3.4/5", "Powerful Zebu breed from Andhra Pradesh, exports globally"),
-    "Khillari":      ("4–6 yrs", "2.8/5", "Heavy draught breed from Maharashtra's Deccan plateau"),
-    "Hallikar":      ("4–7 yrs", "3.1/5", "Racing and draught breed from Karnataka"),
-    "Rathi":         ("3–5 yrs", "3.0/5", "Arid-zone dairy breed from Rajasthan's Bikaner region"),
-    "Deoni":         ("4–6 yrs", "3.0/5", "Black-and-white spotted dual-purpose from Maharashtra"),
-    "Malnad Gidda":  ("3–5 yrs", "2.8/5", "Disease-resistant hill breed from Karnataka forests"),
-    "Amrit Mahal":   ("4–7 yrs", "3.1/5", "Historic draught breed from Karnataka"),
-    "Kangayam":      ("4–6 yrs", "3.0/5", "Compact draught breed from Kongu Nadu region, Tamil Nadu"),
-    "Krishna Valley":("4–6 yrs", "3.1/5", "Large white draught breed from Andhra Pradesh"),
-    "Murrah":        ("4–7 yrs", "3.4/5", "World's best buffalo breed for milk yield, Haryana origin"),
-    "Jaffarabadi":   ("5–8 yrs", "3.5/5", "Heaviest Indian buffalo, high milk yield in humid zones"),
-    "Surti":         ("4–6 yrs", "3.2/5", "Coastal dairy buffalo, high fat content, Gujarat origin"),
-    "Mehsana":       ("4–6 yrs", "3.1/5", "Commercial dairy buffalo from North Gujarat"),
-    "Nili-Ravi":     ("4–7 yrs", "3.3/5", "High yielding buffalo with white markings, Punjab origin"),
-    "Bhadawari":     ("4–6 yrs", "3.2/5", "Highest fat content in Indian buffaloes, UP origin"),
-    "Pandharpuri":   ("4–6 yrs", "3.0/5", "Tall buffalo with very long horns from Maharashtra"),
-    "Nagpuri":       ("4–6 yrs", "3.0/5", "Dual-purpose buffalo from Vidarbha region"),
-    "Chilika":       ("3–5 yrs", "2.9/5", "Coastal wetland buffalo from Odisha"),
-    "Toda":          ("4–6 yrs", "2.9/5", "Sacred heritage buffalo from Nilgiri Hills"),
+    # breed: (origin, milk_yield, description)
+    "Gir":             ("Gujarat, India",        "1200–1800 kg/lac", "Zebu breed, papaya-red, prominent hump, long ears"),
+    "Sahiwal":         ("Punjab, India",          "1400–2500 kg/lac", "Best Zebu dairy breed, highly tick-resistant"),
+    "Red Sindhi":      ("Sindh, Pakistan/India",  "1000–1800 kg/lac", "Heat-tolerant dairy breed for smallholders"),
+    "Tharparkar":      ("Rajasthan/Sindh",        "1000–1600 kg/lac", "Dual-purpose arid-zone breed, lyre-shaped horns"),
+    "Kankrej":         ("Gujarat, India",          "1000–1400 kg/lac", "Heavy dual-purpose Zebu, silver-grey color"),
+    "Hariana":         ("Haryana, India",          "900–1200 kg/lac",  "Efficient draught breed, white with grey markings"),
+    "Ongole":          ("Andhra Pradesh",          "800–1100 kg/lac",  "Large Zebu breed exported globally"),
+    "Khillari":        ("Maharashtra, India",      "500–700 kg/lac",   "Prime draught breed, compact muscular build"),
+    "Hallikar":        ("Karnataka, India",        "600–900 kg/lac",   "Racing and draught breed"),
+    "Rathi":           ("Rajasthan, India",        "900–1300 kg/lac",  "Arid-zone dairy breed"),
+    "Deoni":           ("Maharashtra, India",      "900–1200 kg/lac",  "Black-and-white spotted dual-purpose"),
+    "Murrah":          ("Haryana/Punjab, India",   "2000–3000 kg/lac", "World's best buffalo for milk yield"),
+    "Jaffrabadi":      ("Gujarat, India",          "1800–2500 kg/lac", "Heaviest Indian buffalo, massive curved horns"),
+    "Jaffarabadi":     ("Gujarat, India",          "1800–2500 kg/lac", "Heaviest Indian buffalo, massive curved horns"),
+    "Surti":           ("Gujarat, India",          "1500–2200 kg/lac", "High-fat milk buffalo"),
+    "Mehsana":         ("Gujarat, India",          "1600–2200 kg/lac", "High-yielding commercial buffalo"),
+    "Nili Ravi":       ("Punjab, India/Pakistan",  "1800–2500 kg/lac", "High-yielding buffalo with white markings"),
+    "Bhadawari":       ("UP/MP, India",            "800–1200 kg/lac",  "Highest butter-fat content buffalo"),
+    "Nagpuri":         ("Vidarbha, Maharashtra",   "1000–1600 kg/lac", "Dual-purpose buffalo, white markings"),
+    "Toda":             ("Nilgiri Hills, TN",      "500–700 kg/lac",   "Sacred heritage buffalo breed"),
+    "Holstein Friesian": ("Netherlands/Global",   "4000–8000 kg/lac", "High-yielding exotic dairy breed"),
+    "Jersey":          ("Jersey Island, UK",       "2500–4000 kg/lac", "High butterfat exotic dairy breed"),
+    "Punganur":        ("Andhra Pradesh",          "500–600 kg/lac",   "World's smallest cattle breed"),
+    "Vechur":          ("Kerala, India",           "300–500 kg/lac",   "Miniature cattle breed from Kerala"),
+    "Unknown Cattle":  ("India",                   "Varies",           "Indian bovine livestock"),
+    "Unknown Buffalo": ("India",                   "Varies",           "Indian buffalo livestock"),
 }
-DEFAULT_META = ("3–6 yrs", "3.0/5", "Indian zebu livestock")
-MODEL_READY  = False
+DEFAULT_META = ("India", "Varies", "Indian bovine livestock")
 
-# ── CLIP detailed breed prompts ────────────────────────────────────────────────
-BREED_PROMPTS = {
-    "Gir":           "a photo of a Gir cattle with distinctive domed forehead and pendulous ears, reddish-brown or spotted coat, zebu humped breed from India",
-    "Sahiwal":       "a photo of a Sahiwal cow, reddish-brown heavy-bodied dairy cattle with loose dewlap and short horns, zebu breed",
-    "Red Sindhi":    "a photo of a Red Sindhi cattle, deep red or dark brown compact zebu cow with short upturned horns",
-    "Tharparkar":    "a photo of a Tharparkar cattle, white or light grey zebu breed with long face and lyre-shaped horns from Thar desert",
-    "Kankrej":       "a photo of a Kankrej cattle, silvery grey large-framed zebu bull or cow with lyre-shaped horns",
-    "Hariana":       "a photo of a Hariana cattle, white or grey lean medium-sized zebu breed with black muzzle",
-    "Ongole":        "a photo of an Ongole cattle, large white zebu with massive hump, long face, and drooping ears",
-    "Khillari":      "a photo of a Khillari cattle, light grey compact zebu draught breed with long tapering horns, muscular body",
-    "Hallikar":      "a photo of a Hallikar cattle, grey compact draught zebu with long curved horns from Karnataka",
-    "Rathi":         "a photo of a Rathi cattle, brown or reddish-brown dairy zebu breed from Rajasthan with medium horns",
-    "Deoni":         "a photo of a Deoni cattle, black and white spotted zebu breed from Maharashtra",
-    "Malnad Gidda":  "a photo of a Malnad Gidda cattle, small-sized black or dark zebu hill breed from Karnataka forests",
-    "Amrit Mahal":   "a photo of an Amrit Mahal cattle, grey or slate-coloured compact zebu with long curved horns",
-    "Kangayam":      "a photo of a Kangayam cattle, grey or white compact zebu draught breed from Tamil Nadu",
-    "Krishna Valley":"a photo of a Krishna Valley cattle, white large zebu breed from Andhra Pradesh with heavy build",
-    "Murrah":        "a photo of a Murrah buffalo, large black river buffalo with tightly coiled corkscrew horns and heavily built body, from Haryana India",
-    "Jaffarabadi":   "a photo of a Jaffarabadi buffalo, massive black river buffalo with large horns sagging on sides, from Gujarat India",
-    "Surti":         "a photo of a Surti buffalo, medium-sized brown or grey swamp buffalo with flat horns, from Gujarat",
-    "Mehsana":       "a photo of a Mehsana buffalo, medium black buffalo with long upward curved horns from Gujarat India",
-    "Nili-Ravi":     "a photo of a Nili-Ravi buffalo, large black river buffalo with white markings on forehead and legs, from Punjab",
-    "Bhadawari":     "a photo of a Bhadawari buffalo, copper or reddish-brown swamp buffalo with light-coloured legs, from Uttar Pradesh",
-    "Pandharpuri":   "a photo of a Pandharpuri buffalo, tall slender black buffalo with very long curved horns, from Maharashtra",
-    "Nagpuri":       "a photo of a Nagpuri buffalo, medium black buffalo with long backward-curved flat horns, from Vidarbha",
-    "Chilika":       "a photo of a Chilika buffalo, small grey-brown swamp buffalo from Odisha coastal wetlands",
-    "Toda":          "a photo of a Toda buffalo, large black or dark grey buffalo from Nilgiri Hills Tamil Nadu",
+def get_species(breed: str) -> str:
+    normalized = breed.replace("_", " ").strip()
+    return "buffalo" if normalized in BUFFALO_BREEDS else "cattle"
+
+ALL_BREEDS = list(BREED_META.keys())
+BREED_SPECIES = {b: get_species(b) for b in ALL_BREEDS}
+
+# Age category definitions
+AGE_CATEGORIES = {
+    "calf":   {"range": "0–6 months", "label": "Calf"},
+    "young":  {"range": "6 months – 2 years", "label": "Young"},
+    "adult":  {"range": "2–6 years", "label": "Adult"},
+    "mature": {"range": "6+ years", "label": "Mature"},
 }
 
-CATTLE_PROMPT  = "a photo of a domestic cattle, cow, bull or zebu bovine animal"
-BUFFALO_PROMPT = "a photo of a domestic water buffalo, river buffalo or swamp buffalo"
-
-
-# ── CLIP model loading ─────────────────────────────────────────────────────────
-_clip_model      = None
-_clip_preprocess = None
-_clip_tokenize   = None
-_device          = "cpu"
+# ── Model loading ─────────────────────────────────────────────────────────────
+_hf_model     = None
+_hf_classes   = []
+_hf_transform = None
+_device       = "cpu"
+MODEL_READY   = False
 
 try:
-    import torch
-    import clip
+    import torch, torch.nn.functional as F
+    from torchvision import transforms
+    import timm
+    from huggingface_hub import hf_hub_download
 
     _device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[BreedService] Loading CLIP ViT-B/32 on {_device} …")
-    _clip_model, _clip_preprocess = clip.load("ViT-B/32", device=_device)
-    _clip_model.eval()
-    _clip_tokenize = clip.tokenize
+    print(f"[BreedService] Loading HF model on {_device} …")
+    model_path   = hf_hub_download("ujjwal75/indian-bovine-breeds-model", "Indian_bovine_finetuned_model.pth")
+    classes_path = hf_hub_download("ujjwal75/indian-bovine-breeds-model", "classes.json")
+    with open(classes_path) as f:
+        _hf_classes = json.load(f)
+    _hf_model = timm.create_model("convnext_tiny", pretrained=False, num_classes=len(_hf_classes))
+    ckpt = torch.load(model_path, map_location=_device)
+    _hf_model.load_state_dict(ckpt.get("model_state_dict", ckpt))
+    _hf_model.to(_device); _hf_model.eval()
+    _hf_transform = transforms.Compose([
+        transforms.Resize((224, 224)), transforms.ToTensor(),
+        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
+    ])
     MODEL_READY = True
-    print("[BreedService] ✅ CLIP ViT-B/32 loaded — real inference active")
+    print("[BreedService] ✅ HF model loaded")
+except Exception as e:
+    print(f"[BreedService] ⚠️ HF model unavailable: {e}")
 
-except Exception as _clip_err:
-    print(f"[BreedService] ⚠️  CLIP not available ({_clip_err}). Using smart demo fallback.")
-    MODEL_READY = False
-
-
-# ── Image preprocessing pipeline ──────────────────────────────────────────────
+# ── Image preprocessing ────────────────────────────────────────────────────────
 def preprocess_image(img: Image.Image) -> Image.Image:
-    """
-    Preprocessing pipeline for breed detection quality improvement:
-    1. EXIF auto-rotate (fixes upside-down phone photos)
-    2. Convert to RGB
-    3. CLAHE-approximation: auto-contrast + modest brightness boost
-    4. Resize to square with padding (preserves aspect ratio)
-    """
-    # EXIF auto-rotate
+    try: img = ImageOps.exif_transpose(img)
+    except: pass
+    return img.convert("RGB")
+
+# ── Gemini Vision: breed + dynamic age ───────────────────────────────────────
+def _gemini_predict(img: Image.Image) -> dict:
+    import requests
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        return {}
+
+    # Resize for API
+    img_r = img.copy(); img_r.thumbnail((1024,1024), Image.LANCZOS)
+    buf = io.BytesIO(); img_r.save(buf, format="JPEG", quality=85)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+
+    prompt = """You are a veterinary expert and livestock specialist analyzing an animal image.
+
+Analyze carefully:
+1. Body size relative to surroundings
+2. Facial features: large eyes proportional to head = young/calf
+3. Horn development: no horns or stub = young/calf; fully developed = adult/mature
+4. Body proportions: short legs relative to body = calf; leggy build = young
+5. Coat texture: soft fluffy = calf; coarser = adult
+6. Udder/testicular development: absent = calf/young
+7. Overall muscle mass and body fullness
+
+Known Indian cattle breeds: Gir, Sahiwal, Tharparkar, Kankrej, Ongole, Hariana, Red Sindhi, Khillari, Hallikar, Rathi, Deoni, Punganur, Vechur, Holstein Friesian, Jersey
+Known Indian buffalo breeds: Murrah, Jaffrabadi, Jaffarabadi, Surti, Mehsana, Nili Ravi, Bhadawari, Nagpuri, Toda
+
+Return ONLY valid JSON (no markdown):
+{
+  "species": "cattle",
+  "age_category": "calf",
+  "age_range": "0-6 months",
+  "age_reasoning": "Large eyes, no horn development, fluffy coat, short proportions",
+  "top_breed": "Murrah",
+  "predictions": [
+    {"breed": "Murrah", "confidence": 0.75, "rank": 1},
+    {"breed": "Nagpuri", "confidence": 0.15, "rank": 2},
+    {"breed": "Surti", "confidence": 0.10, "rank": 3}
+  ]
+}"""
+
     try:
-        img = ImageOps.exif_transpose(img)
-    except Exception:
-        pass
+        resp = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}",
+            json={
+                "contents": [{"parts": [
+                    {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
+                    {"text": prompt}
+                ]}],
+                "generationConfig": {"temperature": 0.1, "maxOutputTokens": 512}
+            }, timeout=25
+        )
+        resp.raise_for_status()
+        
+        text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        m = re.search(r'\{[\s\S]*\}', text)
+        if not m: return {}
+        data = json.loads(m.group())
+        preds = data.get("predictions", [])
+        if not preds: return {}
+        predictions = [
+            {"breed": str(p.get("breed","Unknown")).strip(), "confidence": float(p.get("confidence",0.33)), "rank": int(p.get("rank", i+1))}
+            for i, p in enumerate(preds[:3])
+        ]
+        return {
+            "predictions": predictions,
+            "age_category": data.get("age_category", "adult"),
+            "age_range": data.get("age_range", "2–6 years"),
+            "age_reasoning": data.get("age_reasoning", ""),
+            "species": data.get("species", "cattle"),
+            "source": "gemini-vision"
+        }
+    except Exception as e:
+        print(f"[BreedService/Gemini] Vision error: {e}")
+        return {}
 
-    img = img.convert("RGB")
-
-    # Auto-contrast (CLAHE approximation with PIL — no OpenCV dependency)
-    img = ImageOps.autocontrast(img, cutoff=1)
-
-    # Modest brightness/contrast boost for underexposed images
-    w, h = img.size
-    arr = np.array(img, dtype=np.float32)
-    mean_lum = arr.mean()
-    if mean_lum < 80:  # underexposed
-        img = ImageEnhance.Brightness(img).enhance(1.3)
-    if mean_lum > 200:  # overexposed
-        img = ImageEnhance.Brightness(img).enhance(0.85)
-    img = ImageEnhance.Contrast(img).enhance(1.15)
-
-    # Resize to 224 with letterbox padding
-    target = 224
-    img.thumbnail((target, target), Image.LANCZOS)
-    padded = Image.new("RGB", (target, target), (128, 128, 128))
-    offset = ((target - img.width) // 2, (target - img.height) // 2)
-    padded.paste(img, offset)
-    return padded
-
-
-# ── Secondary colour/texture heuristic (ensemble component) ───────────────────
-def _heuristic_predict(img: Image.Image) -> List[dict]:
-    """
-    Colour-statistics heuristic. Used as ensemble component when CLIP
-    confidence is below 0.80.
-    NOT real ML — it's a conservative prior over image brightness/hue.
-    """
-    buf  = io.BytesIO()
-    img.save(buf, format="PNG")
-    seed = int(hashlib.md5(buf.getvalue()).hexdigest(), 16) % (2**31)
-    rng  = random.Random(seed)
-
-    img_small = img.resize((64, 64)).convert("RGB")
-    pixels    = list(img_small.getdata())
-    avg_r = sum(p[0] for p in pixels) / len(pixels)
-    avg_g = sum(p[1] for p in pixels) / len(pixels)
-    avg_b = sum(p[2] for p in pixels) / len(pixels)
-    lightness = (avg_r + avg_g + avg_b) / 3
-
-    # Very dark → likely buffalo; warm browns → Gir/Sahiwal/Rathi;
-    # cool whites/greys → Hariana, Tharparkar, Kankrej
-    if lightness < 90:
-        pool = BUFFALO_BREEDS
-    elif avg_r > avg_b + 20:  # warm reddish
-        pool = ["Gir", "Sahiwal", "Red Sindhi", "Rathi", "Bhadawari"]
-    elif lightness > 180:     # very light / white
-        pool = ["Hariana", "Tharparkar", "Kankrej", "Ongole", "Krishna Valley"]
-    else:
-        pool = ALL_BREEDS
-
-    top  = rng.choice(pool)
-    rest = [b for b in pool if b != top]
-    rng.shuffle(rest)
-    tc = rng.uniform(0.65, 0.82)
-    r2 = rng.uniform(0.08, 0.20)
-    r3 = max(0.01, 1.0 - tc - r2)
-    return [
-        {"breed": top,              "confidence": round(tc, 4), "rank": 1},
-        {"breed": rest[0] if rest else top, "confidence": round(r2, 4), "rank": 2},
-        {"breed": rest[1] if len(rest) > 1 else top, "confidence": round(r3, 4), "rank": 3},
-    ]
-
-
-# ── CLIP zero-shot inference ───────────────────────────────────────────────────
-def _clip_predict(img: Image.Image) -> List[dict]:
-    """
-    Zero-shot breed classification via CLIP:
-      1. Species gate (cattle vs buffalo)
-      2. Breed ranking over winning species pool
-    Returns top-3 predictions with genuine softmax confidence.
-    """
-    import torch
-    import torch.nn.functional as F
-
-    image_tensor = _clip_preprocess(img).unsqueeze(0).to(_device)
-
+# ── HuggingFace model inference ───────────────────────────────────────────────
+def _hf_predict(img: Image.Image) -> List[dict]:
+    import torch, torch.nn.functional as F
+    t = _hf_transform(img).unsqueeze(0).to(_device)
     with torch.no_grad():
-        species_texts  = _clip_tokenize([CATTLE_PROMPT, BUFFALO_PROMPT]).to(_device)
-        img_feats      = _clip_model.encode_image(image_tensor)
-        species_feats  = _clip_model.encode_text(species_texts)
-        img_feats      = F.normalize(img_feats, dim=-1)
-        species_feats  = F.normalize(species_feats, dim=-1)
-        species_logits = (img_feats @ species_feats.T).squeeze(0)
-        species_probs  = F.softmax(species_logits * 100, dim=0)
-        cattle_prob    = species_probs[0].item()
-
-        if cattle_prob >= 0.60:
-            candidate_breeds  = CATTLE_BREEDS
-        elif cattle_prob <= 0.40:
-            candidate_breeds  = BUFFALO_BREEDS
-        else:
-            candidate_breeds  = ALL_BREEDS
-
-        breed_prompts_list = [BREED_PROMPTS[b] for b in candidate_breeds]
-        breed_texts  = _clip_tokenize(breed_prompts_list, truncate=True).to(_device)
-        breed_feats  = _clip_model.encode_text(breed_texts)
-        breed_feats  = F.normalize(breed_feats, dim=-1)
-        breed_logits = (img_feats @ breed_feats.T).squeeze(0)
-        breed_probs  = F.softmax(breed_logits * 100, dim=0).cpu().numpy()
-
-    ranked = sorted(enumerate(candidate_breeds), key=lambda x: breed_probs[x[0]], reverse=True)
+        probs = F.softmax(_hf_model(t), dim=1).squeeze(0).cpu().numpy()
+    ranked = sorted(enumerate(_hf_classes), key=lambda x: probs[x[0]], reverse=True)
     return [
-        {"breed": b, "confidence": float(round(float(breed_probs[idx]), 4)), "rank": rank}
-        for rank, (idx, b) in enumerate(ranked[:3], start=1)
+        {"breed": b.replace("_"," "), "confidence": float(round(float(probs[idx]),4)), "rank": r}
+        for r, (idx, b) in enumerate(ranked[:3], start=1)
     ]
 
-
-# ── Ensemble blending ──────────────────────────────────────────────────────────
-def _ensemble_blend(clip_preds: List[dict], heuristic_preds: List[dict]) -> List[dict]:
+# ── Age heuristic from image pixel analysis ────────────────────────────────────
+def _estimate_age_heuristic(img: Image.Image) -> dict:
     """
-    Blend CLIP and heuristic predictions when top confidence < 0.80.
-    CLIP gets 80% weight; heuristic gets 20%.
+    Dynamic visual heuristics when AI is unavailable.
+    Varies between calf, young, adult, mature based on image edge density and lighting variance.
     """
-    scores: dict[str, float] = {}
-    for p in clip_preds:
-        scores[p["breed"]] = scores.get(p["breed"], 0) + p["confidence"] * 0.80
-    for p in heuristic_preds:
-        scores[p["breed"]] = scores.get(p["breed"], 0) + p["confidence"] * 0.20
+    # Crop to the center 50% to ignore background noise (grass/trees)
+    width, height = img.size
+    left = int(width * 0.25)
+    top = int(height * 0.25)
+    right = int(width * 0.75)
+    bottom = int(height * 0.75)
+    cropped = img.crop((left, top, right, bottom))
 
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    total  = sum(v for _, v in ranked[:3])
-    result = []
-    for rank, (breed, score) in enumerate(ranked[:3], start=1):
-        result.append({"breed": breed, "confidence": round(score / total if total else score, 4), "rank": rank})
-    return result
+    small = cropped.resize((128, 128)).convert("RGB")
+    arr = np.array(small)
+    
+    # Calculate image edge complexity (calves often have fuzzier/softer coats)
+    gray = np.mean(arr, axis=2)
+    edges = np.abs(np.diff(gray, axis=0)).mean() + np.abs(np.diff(gray, axis=1)).mean()
+    
+    # Calculate variance (mature animals often have larger uniform body areas)
+    variance = np.var(gray)
 
+    # Tighter thresholds since background grass is cropped out
+    if edges > 15.0 and variance < 2000:
+        return {"age_category": "calf", "age_range": "0–6 months", "age_reasoning": "High center fuzz density detected"}
+    elif edges > 12.0 and variance < 3500:
+        return {"age_category": "young", "age_range": "6 months – 2 years", "age_reasoning": "Moderate youthful coat complexity"}
+    elif variance > 5000:
+        return {"age_category": "mature", "age_range": "6+ years", "age_reasoning": "Large developed body mass footprint detected"}
+    else:
+        return {"age_category": "adult", "age_range": "2–6 years", "age_reasoning": "Standard adult structural features detected"}
 
-# ── Demo fallback (no CLIP) ───────────────────────────────────────────────────
-def _demo_predict(img: Image.Image) -> List[dict]:
-    return _heuristic_predict(img)
-
+# ── Color-based pure fallback ──────────────────────────────────────────────────
+def _heuristic_predict(img: Image.Image) -> List[dict]:
+    buf = io.BytesIO(); img.save(buf, format="PNG")
+    seed = int(hashlib.md5(buf.getvalue()).hexdigest(), 16) % (2**31)
+    rng = random.Random(seed)
+    small = img.resize((64,64)).convert("RGB")
+    pixels = list(small.getdata())
+    avg_r = sum(p[0] for p in pixels)/len(pixels)
+    avg_g = sum(p[1] for p in pixels)/len(pixels)
+    lightness = sum((p[0]+p[1]+p[2])/3 for p in pixels)/len(pixels)
+    if lightness < 80:   pool = ["Murrah","Nagpuri","Bhadawari","Jaffrabadi"]
+    elif avg_r > avg_g+20: pool = ["Gir","Sahiwal","Red Sindhi"]
+    else:                 pool = ["Tharparkar","Hariana","Holstein Friesian","Kankrej"]
+    top = rng.choice(pool); rest = [b for b in pool if b != top]; rng.shuffle(rest)
+    return [
+        {"breed": top,                    "confidence": round(rng.uniform(0.45,0.65),4), "rank":1},
+        {"breed": rest[0] if rest else top, "confidence": round(rng.uniform(0.15,0.30),4), "rank":2},
+        {"breed": rest[1] if len(rest)>1 else top, "confidence": round(rng.uniform(0.05,0.15),4), "rank":3},
+    ]
 
 # ── Public API ────────────────────────────────────────────────────────────────
 def detect_breed(image_bytes: bytes) -> dict:
-    """
-    Detect breed from raw image bytes.
-    Pipeline: preprocess → CLIP (if available) → ensemble if low-conf → fallback
-    Returns dict matching BreedDetectResponse schema.
-    """
     raw_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     img     = preprocess_image(raw_img)
+    
+    age_info = None
+    gemini_used = False
+    predictions = []
+    model_version = "unknown"
 
-    if MODEL_READY and _clip_model is not None:
-        predictions   = _clip_predict(img)
-        model_version = "clip-zero-shot-v2+preprocessing"
+    # Strategy 1: High-Accuracy Cloud Vision API (Primary)
+    if os.environ.get("GEMINI_API_KEY"):
+        gemini_result = _gemini_predict(img)
+        if gemini_result and gemini_result.get("predictions"):
+            predictions   = gemini_result["predictions"]
+            age_info      = gemini_result
+            model_version = "gemini-2.0-flash-vision"
+            gemini_used   = True
+            print(f"[BreedService] Gemini Vision: {predictions[0]['breed']} ({predictions[0]['confidence']:.0%})")
 
-        # If top confidence is low, run ensemble with heuristic
-        if predictions[0]["confidence"] < 0.80:
-            heuristic    = _heuristic_predict(img)
-            predictions  = _ensemble_blend(predictions, heuristic)
-            model_version = "clip-ensemble-v2"
-    else:
-        predictions   = _demo_predict(img)
-        model_version = "demo-heuristic-v2"
+    # Strategy 2: Local HuggingFace Model (Fallback)
+    if not predictions and MODEL_READY and _hf_model is not None:
+        try:
+            predictions   = _hf_predict(img)
+            model_version = "hf-ujjwal75-v1-fallback"
+            print(f"[BreedService] HF Fallback: {predictions[0]['breed']}")
+        except Exception as e:
+            print(f"[BreedService] HF failed: {e}")
+
+    # Strategy 3: Color heuristic (last resort)
+    if not predictions:
+        predictions   = _heuristic_predict(img)
+        model_version = "color-heuristic-v5"
+        print("[BreedService] Using heuristic fallback")
+
+    # If we have breed but no age_info, estimate from heuristic
+    if not age_info:
+        age_info = _estimate_age_heuristic(img)
 
     top        = predictions[0]
     breed_name = top["breed"]
-    species    = BREED_SPECIES.get(breed_name, "cattle")
+    species    = age_info.get("species") if age_info and age_info.get("species") else get_species(breed_name)
     meta       = BREED_META.get(breed_name, DEFAULT_META)
+    age_cat    = age_info.get("age_category", "adult") if age_info else "adult"
+    age_range  = age_info.get("age_range", "2–6 years") if age_info else "2–6 years"
+    age_label  = AGE_CATEGORIES.get(age_cat, AGE_CATEGORIES["adult"])["label"]
 
     return {
-        "success":       True,
-        "top_breed":     breed_name,
-        "confidence":    top["confidence"],
-        "predictions":   predictions,
-        "species":       species,
-        "estimated_age": meta[0],
-        "bcs":           meta[1],
-        "notes":         f"Recommended for: {meta[2]}",
-        "model_version": model_version,
+        "success":        True,
+        "top_breed":      breed_name,
+        "confidence":     top["confidence"],
+        "predictions":    predictions,
+        "species":        species,
+        # Dynamic age fields
+        "age_category":      age_cat,
+        "age_range":         age_range,
+        "age_label":         age_label,
+        "age_reasoning":     age_info.get("age_reasoning","") if age_info else "",
+        # Legacy field (kept for compatibility) — now dynamic
+        "estimated_age":     age_range,
+        # Breed metadata
+        "origin":         meta[0],
+        "milk_yield":     meta[1],
+        "notes":          meta[2],
+        "bcs":            "3.0/5",
+        "model_version":  model_version,
+        "gemini_used":    gemini_used,
     }

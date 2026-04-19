@@ -41,12 +41,18 @@ export const lookupTransferUser = (email, phone) =>
 export const deleteAnimal = (id) =>
     api.delete(`/api/animals/${id}`).then(r => r.data)
 
+export const regenerateQR = (animal_id) =>
+    api.post(`/api/animals/${animal_id}/regenerate-qr`).then(r => r.data)
+
 export const searchByTag = (tag) =>
     api.get(`/api/animals/${encodeURIComponent(tag.trim())}`).then(r => r.data)
 
 /* ── QR ──────────────────────────────────────────────── */
-export const qrDownloadUrl = (qrId) =>
+export const qrImageUrl = (qrId) =>
     `${BASE}/api/animals/qr/${qrId}`
+
+export const qrDownloadUrl = (qrId) =>
+    `${BASE}/api/animals/qr/${qrId}?download=1`
 
 export const decodeQR = (body) =>
     api.post('/api/animals/decode-qr', body).then(r => r.data)

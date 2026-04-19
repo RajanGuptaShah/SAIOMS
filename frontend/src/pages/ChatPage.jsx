@@ -203,17 +203,22 @@ export default function ChatPage() {
         e.preventDefault()
         if (!text.trim() || sending) return
         if (aiMode) {
-            setAiMessages(prev => [...prev, { role: 'user', text: text.trim() }])
-            const q = text.trim(); setText(''); setAiLoading(true)
+            const q = text.trim()
+            setText('')
+            setAiMessages(prev => [...prev, { role: 'user', text: q }])
+            setAiLoading(true)
             try {
-                const d = await geminiChat({ message: q })
+                // Pass last 6 turns as history for multi-turn context
+                const history = aiMessages.slice(-6)
+                const d = await geminiChat({ message: q, history })
                 setAiMessages(prev => [...prev, { role: 'ai', text: d.response || 'No response.' }])
             } catch {
-                setAiMessages(prev => [...prev, { role: 'ai', text: 'Error getting response. Please try again.' }])
+                setAiMessages(prev => [...prev, { role: 'ai', text: '❌ Could not reach AI. Check internet connection and try again.' }])
             }
             setAiLoading(false)
             return
         }
+
         setSending(true)
         try {
             await sendChatMessage({ room: activeRoom, text: text.trim() })
@@ -368,9 +373,39 @@ export default function ChatPage() {
                                 <div style={{ flex: 1, overflowY: 'auto', padding: '16px 18px', display: 'flex', flexDirection: 'column', gap: 10 }}>
                                     {aiMode ? (
                                         <>
-                                            <div style={{ background: 'rgba(45,106,79,0.08)', padding: '12px 16px', borderRadius: 16, fontSize: 13, color: 'var(--primary)', fontWeight: 600, maxWidth: '85%', animation: 'msgSlideIn 0.3s ease both' }}>
-                                                {isHindi ? '🤖 नमस्ते! मैं SAIOMS AI सहायक हूँ। पशु स्वास्थ्य, नस्ल, टीकाकरण, या किसी भी प्रश्न में मदद के लिए पूछें!' : '🤖 Hello! I\'m SAIOMS AI Assistant. Ask me about animal health, breeds, vaccinations, or any livestock query!'}
+                                            <div style={{ background: 'rgba(45,106,79,0.08)', padding: '12px 16px', borderRadius: 16, fontSize: 13, color: 'var(--primary)', fontWeight: 600, maxWidth: '85%', animation: 'msgSlideIn 0.3s ease both', lineHeight: 1.6 }}>
+                                                🤖 {isHindi
+                                                    ? 'नमस्ते! मैं SAIOMS AI सहायक हूँ। मैं इन विषयों में मदद कर सकता हूँ:'
+                                                    : "Hello! I'm SAIOMS AI Assistant. I can help you with:"}
+                                                <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 3, fontSize: 12 }}>
+                                                    {['🐄 Animal breeds & identification', '💉 Vaccination schedules & reminders', '🏥 Finding nearby vets & gaushalas', '📱 How to use SAIOMS features', '🌿 Healthcare & disease symptoms', '📋 Government schemes for farmers'].map((item, i) => (
+                                                        <div key={i} style={{ opacity: 0.9 }}>{item}</div>
+                                                    ))}
+                                                </div>
                                             </div>
+
+                                            {/* Quick suggestion chips — shown only when no messages yet */}
+                                            {aiMessages.length === 0 && (
+                                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7, maxWidth: '85%' }}>
+                                                    {[
+                                                        isHindi ? 'गिर गाय की पहचान कैसे करें?' : 'How to identify a Gir cow?',
+                                                        isHindi ? 'FMD टीकाकरण कब करें?' : 'When to give FMD vaccine?',
+                                                        isHindi ? 'नज़दीकी गौशाला कैसे खोजें?' : 'How to find nearby gaushala?',
+                                                        isHindi ? 'QR कोड कैसे स्कैन करें?' : 'How to scan a QR code?',
+                                                        isHindi ? 'पशु कैसे रजिस्टर करें?' : 'How to register an animal?',
+                                                    ].map((q, i) => (
+                                                        <button key={i}
+                                                            onClick={() => { setText(q); setTimeout(() => document.querySelector('form[data-ai-form]')?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })), 50) }}
+                                                            style={{ padding: '6px 12px', borderRadius: 999, border: '1.5px solid rgba(45,106,79,0.25)', background: '#fff', cursor: 'pointer', fontSize: 11, fontWeight: 600, fontFamily: 'inherit', color: '#1B4332', transition: 'background 0.15s' }}
+                                                            onMouseEnter={e => e.currentTarget.style.background = 'rgba(45,106,79,0.08)'}
+                                                            onMouseLeave={e => e.currentTarget.style.background = '#fff'}
+                                                        >
+                                                            {q}
+                                                        </button>
+                                                    ))}
+                                                </div>
+                                            )}
+
                                             {aiMessages.map((m, i) => (
                                                 <div key={i} style={{
                                                     alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start',
@@ -378,7 +413,7 @@ export default function ChatPage() {
                                                     color: m.role === 'user' ? '#FAF7F0' : 'var(--dark)',
                                                     padding: '10px 14px',
                                                     borderRadius: m.role === 'user' ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
-                                                    maxWidth: '80%', fontSize: 13, lineHeight: 1.5,
+                                                    maxWidth: '80%', fontSize: 13, lineHeight: 1.6,
                                                     whiteSpace: 'pre-wrap', wordBreak: 'break-word',
                                                     animation: 'msgSlideIn 0.28s ease both',
                                                 }}>
@@ -396,6 +431,7 @@ export default function ChatPage() {
                                                 </div>
                                             )}
                                         </>
+
                                     ) : activeRoom ? (
                                         messages.length > 0 ? messages.map((m, i) => {
                                             const isMine = m.sender === user?._id || m.senderName === user?.name
@@ -416,7 +452,8 @@ export default function ChatPage() {
 
                                 {/* Input */}
                                 {(activeRoom || aiMode) && (
-                                    <form onSubmit={handleSend} style={{ padding: '12px 18px', borderTop: '1px solid var(--border)', display: 'flex', gap: 8, alignItems: 'center' }}>
+                                    <form data-ai-form onSubmit={handleSend} style={{ padding: '12px 18px', borderTop: '1px solid var(--border)', display: 'flex', gap: 8, alignItems: 'center' }}>
+
                                         {!aiMode && (
                                             <>
                                                 <input type="file" ref={fileRef} accept="image/*" style={{ display: 'none' }} onChange={handleImage} />

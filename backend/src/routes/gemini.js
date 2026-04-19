@@ -1,151 +1,145 @@
 /**
- * SAIOMS — Gemini AI Proxy Router
- * POST /api/gemini/enhance-nearby   — Nearby services via Gemini (primary search)
- * POST /api/gemini/chat             — AI chatbot for animal care queries
- * POST /api/gemini/vaccine-alerts   — Automated vaccine schedule via Gemini
+ * SAIOMS — Gemini AI Proxy Router v4
+ * Uses gemini-1.5-flash (higher free-tier RPM limits) with a compact system prompt
+ * POST /api/gemini/chat             — General-purpose AI assistant (SAIOMS-aware)
+ * POST /api/gemini/enhance-nearby   — Nearby services
+ * POST /api/gemini/vaccine-alerts   — Vaccine schedule
+ * GET  /api/gemini/status           — API key health check
  */
 const express = require('express');
 const axios = require('axios');
 const router = express.Router();
 
-const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
+// Use Pollinations AI (free, no strict rate limits)
+const GEMINI_URL = 'https://text.pollinations.ai/openai';
 
-async function callGemini(prompt, maxTokens = 1500) {
-    const key = process.env.GEMINI_API_KEY;
-    if (!key) throw new Error('Gemini API key not configured');
-    const res = await axios.post(`${GEMINI_URL}?key=${key}`, {
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.5, maxOutputTokens: maxTokens },
-    }, { timeout: 20000 });
-    return res.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+/* ── Core Gemini call ─────────────────────────────────────────────────────── */
+async function callGemini(contents, maxTokens = 1024, temperature = 0.7) {
+    // Translate Gemini contents (role/parts) to OpenAI messages (role/content)
+    const messages = contents.map(c => ({
+        role: c.role === 'model' ? 'assistant' : 'user',
+        content: c.parts[0].text
+    }));
+
+    const res = await axios.post(GEMINI_URL, {
+        messages,
+        model: 'openai',
+        temperature,
+        max_tokens: maxTokens
+    }, { 
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 30000 
+    });
+
+    const text = typeof res.data === 'string' ? res.data : (res.data.choices?.[0]?.message?.content || JSON.stringify(res.data));
+    if (!text) throw new Error('Empty response from AI API');
+    return text;
 }
 
-/**
- * POST /api/gemini/enhance-nearby
- * Body: { city, state, category }
- * Returns AI-enhanced suggestions for nearby services
- */
+/* ── Compact SAIOMS system context (reduces tokens per request) ──────────── */
+const SYSTEM_CONTEXT = `You are SAIOMS AI — a smart, friendly, general-purpose AI assistant embedded in the Smart Animal ID & Management System.
+
+Here is exactly how users can use SAIOMS features:
+1. QR Scanner: Go to the Dashboard or tap the central Scan icon in the navigation. You can scan a QR code using your camera or enter a 6-digit manual ID to view an animal's profile.
+2. AI Breed Detector: Go to Dashboard -> "Detect Breed" (or ML Service). Upload an animal's photo or use the camera, and the AI will predict its breed.
+3. Help Nearby: Tap "Nearby" in the navigation. Allow location access or manually type your City/State to find Veterinary Hospitals, Gaushalas, and NGOs on Google Maps.
+4. My Animals & Add Animal: Go to "My Animals" from the Dashboard. Tap "Add New Animal" to register a new animal with its details (species, breed, age). You can also link a QR tracker tag here.
+5. Chat & Community: Tap "Chat" in navigation. Here you can chat with me (AI), post on the global community board, or direct message other farmers and vets.
+6. Vaccine Alerts: View overdue or upcoming vaccine schedules on your User Profile or Dashboard notifications. It automatically tracks FMD, HS/BQ, etc. based on your registered animals.
+
+You can answer ANY question — animal health, breeds, farming, vaccinations, government schemes, science, technology, general knowledge, India/Nepal geography — anything the user asks.
+
+For SAIOMS features: use the exact instructions above to guide users step-by-step.
+For animal health emergencies: strongly recommend a local vet.
+Reply in the SAME LANGUAGE as the user (Hindi or English).
+Be helpful, warm, and concise (under 400 words). Use bullet points and emojis.`;
+
+/* ── GET /status — health check ───────────────────────────────────────────── */
+router.get('/status', async (req, res) => {
+    try {
+        await callGemini([{ role: 'user', parts: [{ text: 'Say OK' }] }], 5, 0.1);
+        res.json({ ok: true, model: 'pollinations-ai', message: 'AI API working' });
+    } catch (err) {
+        res.json({ ok: false, error: err.message });
+    }
+});
+
+/* ── POST /chat — general-purpose AI assistant ────────────────────────────── */
+router.post('/chat', async (req, res) => {
+    try {
+        const { message, history = [] } = req.body;
+        if (!message?.trim()) return res.status(400).json({ success: false, detail: 'message required' });
+
+        const contents = [
+            // System context as first user message (Gemini doesn't have a system role)
+            { role: 'user', parts: [{ text: SYSTEM_CONTEXT }] },
+            { role: 'model', parts: [{ text: 'Got it! I\'m SAIOMS AI. Ask me anything — animal health, breeds, how to use SAIOMS, general questions, or anything else!' }] },
+            // Conversation history (last 8 turns for context)
+            ...history.slice(-8).map(h => ({
+                role: h.role === 'user' ? 'user' : 'model',
+                parts: [{ text: h.text }]
+            })),
+            // Current message
+            { role: 'user', parts: [{ text: message.trim() }] }
+        ];
+
+        const text = await callGemini(contents, 1024, 0.7);
+        res.json({ success: true, response: text });
+
+    } catch (err) {
+        console.error('[Gemini/chat]', err.message);
+        const isQuota = err.message.includes('429') || err.message.toLowerCase().includes('quota') || err.message.toLowerCase().includes('rate');
+        const isKey = err.message.includes('API_KEY') || err.message.includes('GEMINI_API_KEY') || err.message.includes('400');
+        let response;
+        if (isKey) response = '🔑 AI key is not configured. Please set GEMINI_API_KEY and restart the backend.';
+        else if (isQuota) response = '⏳ Too many requests — please wait 30 seconds and try again. (Free tier limit reached)';
+        else response = `❌ AI error: ${err.message}`;
+        res.json({ success: false, response });
+    }
+});
+
+/* ── POST /enhance-nearby ─────────────────────────────────────────────────── */
 router.post('/enhance-nearby', async (req, res) => {
     try {
-        const { city, state, category } = req.body;
-        if (!city) return res.status(400).json({ success: false, detail: 'city is required' });
-
+        const { city, state } = req.body;
+        if (!city) return res.status(400).json({ success: false, detail: 'city required' });
         const statePart = state ? `, ${state}` : '';
-
-        const prompt = `You are an expert on Indian animal welfare services and livestock management infrastructure.
-
-List the top 8-10 well-known animal welfare services in or near ${city}${statePart}, India. Include ALL types: veterinary hospitals/clinics, gaushalas (cow shelters), animal welfare NGOs, and animal shelters.
-
-For EACH place provide:
-- name: Official name exactly as commonly known
-- address: Full street address or area name (be as specific as possible)
-- phone: Phone number if commonly available (or null)
-- description: One sentence describing what they specialize in
-- approxDistance: Approximate distance from ${city} city center (e.g. "2 km", "within city")
-- category: one of "vet", "gaushala", "ngo", or "shelter"
-- website: Website URL if known (or null)
-
-Return ONLY a valid JSON array with these keys. No markdown, no explanation, no code block. Example:
-[{"name":"...","address":"...","phone":"...","description":"...","approxDistance":"...","category":"vet","website":null}]
-
-If you cannot find specific places for ${city}, return information about well-known animal services in nearby major cities of the same region. Do NOT return an empty array — always provide at least 4-6 results.`;
-
-        const text = await callGemini(prompt, 2000);
+        const prompt = `List 8-10 animal welfare services near ${city}${statePart}, India/Nepal. Include vet hospitals, gaushalas, NGOs, shelters.
+For each: name, address, phone (null if unknown), description (1 line), category (vet/gaushala/ngo/shelter), website (null).
+Return ONLY valid JSON array: [{"name":"...","address":"...","phone":null,"description":"...","category":"vet","website":null}]`;
+        const text = await callGemini([{ role: 'user', parts: [{ text: prompt }] }], 2000, 0.2);
         let suggestions = [];
-        try {
-            const jsonMatch = text.match(/\[[\s\S]*\]/);
-            if (jsonMatch) suggestions = JSON.parse(jsonMatch[0]);
-        } catch { suggestions = []; }
-
+        try { const m = text.match(/\[[\s\S]*\]/); if (m) suggestions = JSON.parse(m[0]); } catch { }
         res.json({ success: true, suggestions, source: 'gemini' });
     } catch (err) {
-        console.error('[Gemini] enhance-nearby error:', err.message);
+        console.error('[Gemini/enhance-nearby]', err.message);
         res.json({ success: true, suggestions: [], source: 'gemini' });
     }
 });
 
-/**
- * POST /api/gemini/chat
- * Body: { message, context? }
- * Returns AI response for animal care queries
- */
-router.post('/chat', async (req, res) => {
-    try {
-        const { message, context } = req.body;
-        if (!message) return res.status(400).json({ success: false, detail: 'message is required' });
-
-        const prompt = `You are SAIOMS AI Assistant — a helpful, knowledgeable expert on Indian livestock management, animal healthcare, breed identification, vaccination schedules, and government schemes for animal welfare in India. You help farmers, veterinarians, and animal welfare workers in Uttar Pradesh and across India.
-
-${context ? `Context: ${context}\n` : ''}
-User's question: ${message}
-
-Provide a helpful, concise, and accurate response in the same language as the question (Hindi or English). If asked about specific medical emergencies, always recommend consulting a local veterinarian. Keep responses under 300 words. Be warm and professional.`;
-
-        const text = await callGemini(prompt, 1024);
-        res.json({ success: true, response: text });
-    } catch (err) {
-        console.error('[Gemini] chat error:', err.message);
-        res.json({ success: true, response: 'Sorry, I am unable to respond right now. Please try again later.' });
-    }
-});
-
-/**
- * POST /api/gemini/vaccine-alerts
- * Body: { animals: [{species, breed, age, vaccinations, district, state}], month (0-11) }
- * Returns AI-generated vaccine recommendations specific to each animal
- */
+/* ── POST /vaccine-alerts ─────────────────────────────────────────────────── */
 router.post('/vaccine-alerts', async (req, res) => {
     try {
         const { animals, month } = req.body;
-        if (!animals || !animals.length) return res.json({ success: true, alerts: [] });
-
-        const monthNames = ['January', 'February', 'March', 'April', 'May', 'June',
-            'July', 'August', 'September', 'October', 'November', 'December'];
-        const currentMonth = monthNames[month ?? new Date().getMonth()];
-        const currentMonthNum = month ?? new Date().getMonth();
-        // Next 60 days span two months
-        const nextMonth = monthNames[(currentMonthNum + 1) % 12];
-
+        if (!animals?.length) return res.json({ success: true, alerts: [] });
+        const monthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+        const cur = month ?? new Date().getMonth();
+        const currentMonth = monthNames[cur];
+        const nextMonth = monthNames[(cur + 1) % 12];
         const animalList = animals.map((a, i) =>
-            `${i + 1}. ${a.species} - ${a.breed}, age: ${a.age || 'unknown'}, location: ${a.district || ''} ${a.state || 'Uttar Pradesh'}, vaccinations given: ${(a.vaccinations || []).map(v => v.vaccine).join(', ') || 'none recorded'}`
+            `${i + 1}. ${a.species} - ${a.breed}, age: ${a.age || '?'}, vaccines: ${(a.vaccinations || []).map(v => v.vaccine).join(', ') || 'none'}`
         ).join('\n');
-
-        const prompt = `You are an expert veterinary advisor specializing in Indian livestock health in Uttar Pradesh.
-
-Current month: ${currentMonth}. The farmer wants vaccination alerts for the next 60 days (${currentMonth} - ${nextMonth}).
-
-Animals:
-${animalList}
-
-For EACH animal that needs a vaccination in the next 60 days, provide an alert with:
-- animalIndex: (1-based index from the list above)
-- vaccine: exact vaccine name
-- urgency: "now" if due this month, "soon" if due next month
-- notes: brief practical note (1-2 sentences max) about why, where to get it in UP
-- isGovtFree: true if available free at govt camps in India
-
-Consider Indian seasonal vaccination calendar:
-- Pre-monsoon (May-Jun): HS, BQ vaccines critical
-- Jan & Jul: FMD doses
-- Every 3 months: Deworming
-- Spring (Mar-Apr): Theileriosis/Tick fever
-- Female calves once: Brucellosis
-
-Return ONLY a valid JSON array. No markdown, no explanation:
-[{"animalIndex":1,"vaccine":"FMD","urgency":"now","notes":"...","isGovtFree":true}]
-
-If no animal needs vaccination in next 60 days, return [].`;
-
-        const text = await callGemini(prompt, 1500);
+        const prompt = `Veterinary advisor for Indian livestock. Month: ${currentMonth}. Next 60 days: ${currentMonth}-${nextMonth}.
+Animals:\n${animalList}
+Indian vaccine calendar: Jan+Jul=FMD, May-Jun=HS/BQ, every 3mo=Deworming, Mar-Apr=Tick fever, female calves once=Brucellosis.
+Return ONLY valid JSON array for animals needing vaccination: [{"animalIndex":1,"vaccine":"FMD","urgency":"now","notes":"...","isGovtFree":true}]
+If none needed return [].`;
+        const text = await callGemini([{ role: 'user', parts: [{ text: prompt }] }], 1000, 0.2);
         let alerts = [];
-        try {
-            const jsonMatch = text.match(/\[[\s\S]*\]/);
-            if (jsonMatch) alerts = JSON.parse(jsonMatch[0]);
-        } catch { alerts = []; }
-
+        try { const m = text.match(/\[[\s\S]*\]/); if (m) alerts = JSON.parse(m[0]); } catch { }
         res.json({ success: true, alerts, month: currentMonth });
     } catch (err) {
-        console.error('[Gemini] vaccine-alerts error:', err.message);
+        console.error('[Gemini/vaccine-alerts]', err.message);
         res.json({ success: true, alerts: [], error: err.message });
     }
 });

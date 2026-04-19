@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { NavLink, useLocation, useNavigate } from 'react-router-dom'
+import { createPortal } from 'react-dom'
 import { useAuth } from '../context/AuthContext'
 import { useTheme } from '../context/ThemeContext'
 import { useLang } from '../context/LanguageContext'
@@ -10,14 +11,16 @@ export default function Navbar() {
     const [scrolled, setScrolled] = useState(false)
     const [mobileOpen, setMobileOpen] = useState(false)
     const [dropOpen, setDropOpen] = useState(false)
+    const [dropPos, setDropPos] = useState({ top: 0, right: 0 })
     const [animals, setAnimals] = useState([])
+    const triggerRef = useRef(null)
     const dropRef = useRef(null)
     const location = useLocation()
     const navigate = useNavigate()
     const isHome = location.pathname === '/'
     const { user, isAuth, logout } = useAuth()
     const { dark, toggle: toggleTheme } = useTheme()
-    const { lang, toggleLang, t, isHindi } = useLang()
+    const { toggleLang, t, isHindi } = useLang()
 
     useEffect(() => {
         const onScroll = () => setScrolled(window.scrollY > 40)
@@ -26,19 +29,52 @@ export default function Navbar() {
         return () => window.removeEventListener('scroll', onScroll)
     }, [])
 
-    useEffect(() => { setMobileOpen(false); setDropOpen(false) }, [location])
+    // Close dropdown on route change
+    useEffect(() => { setMobileOpen(false); setDropOpen(false) }, [location.pathname])
 
     useEffect(() => {
         if (isAuth) listAnimals({ limit: 100 }).then(d => setAnimals(d.animals || d)).catch(() => { })
     }, [isAuth])
 
+    // Close dropdown on outside click
     useEffect(() => {
-        const h = (e) => { if (dropRef.current && !dropRef.current.contains(e.target)) setDropOpen(false) }
+        const h = (e) => {
+            if (
+                triggerRef.current && !triggerRef.current.contains(e.target) &&
+                dropRef.current && !dropRef.current.contains(e.target)
+            ) setDropOpen(false)
+        }
         document.addEventListener('mousedown', h)
         return () => document.removeEventListener('mousedown', h)
     }, [])
 
+    // Position the portal dropdown below the trigger button
+    const openDrop = () => {
+        if (triggerRef.current) {
+            const rect = triggerRef.current.getBoundingClientRect()
+            setDropPos({ top: rect.bottom + 10, right: window.innerWidth - rect.right })
+        }
+        setDropOpen(o => !o)
+    }
+
     const handleLogout = () => { logout(); navigate('/') }
+
+    const navTo = (to, tabId) => () => {
+        setDropOpen(false)
+        navigate(to, tabId ? { state: { tab: tabId } } : undefined)
+    }
+
+    const dropItems = [
+        { onClick: navTo('/profile'), icon: '👤', label: t('My Profile') },
+        { onClick: navTo('/profile', 'notifications'), icon: '🔔', label: t('Alerts & Notifications') },
+        { onClick: navTo('/profile', 'vaccines'), icon: '💉', label: t('Vaccine Schedule') },
+        { onClick: navTo('/profile', 'transfers'), icon: '🔄', label: t('Transfer History') },
+        null,
+        { onClick: navTo('/dashboard'), icon: '📊', label: t('My Animals') },
+        { onClick: navTo('/nearby'), icon: '🗺️', label: t('Find Nearby Vets') },
+        null,
+        { onClick: handleLogout, icon: '🚪', label: t('Logout'), danger: true },
+    ]
 
     const links = [
         { to: '/', label: `🏠 ${t('Home')}`, end: true },
@@ -53,19 +89,6 @@ export default function Navbar() {
         { to: '/scan-qr', label: `📷 ${t('Scan')}` },
     ]
 
-    const navTo = (to, tabId) => () => { setDropOpen(false); navigate(to, tabId ? { state: { tab: tabId } } : undefined) }
-    const dropItems = [
-        { onClick: navTo('/profile'), icon: '👤', label: t('My Profile') },
-        { onClick: navTo('/profile', 'notifications'), icon: '🔔', label: t('Alerts & Notifications') },
-        { onClick: navTo('/profile', 'vaccines'), icon: '💉', label: t('Vaccine Schedule') },
-        { onClick: navTo('/profile', 'transfers'), icon: '🔄', label: t('Transfer History') },
-        null,
-        { onClick: navTo('/dashboard'), icon: '📊', label: t('My Animals') },
-        { onClick: navTo('/nearby'), icon: '🗺️', label: t('Find Nearby Vets') },
-        null,
-        { onClick: handleLogout, icon: '🚪', label: t('Logout'), danger: true },
-    ]
-
     /* ── Shared toggle button style ── */
     const toggleBtnStyle = (active) => ({
         display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -76,6 +99,70 @@ export default function Navbar() {
         cursor: 'pointer', fontSize: 15, fontWeight: 800,
         fontFamily: 'inherit', transition: 'all 0.2s', flexShrink: 0,
     })
+
+    /* ── Portal Dropdown (rendered at document.body) ── */
+    const DropdownPortal = dropOpen && createPortal(
+        <>
+            {/* Invisible backdrop to catch outside clicks */}
+            <div
+                style={{ position: 'fixed', inset: 0, zIndex: 99998 }}
+                onMouseDown={() => setDropOpen(false)}
+            />
+            {/* Dropdown panel */}
+            <div
+                ref={dropRef}
+                style={{
+                    position: 'fixed',
+                    top: dropPos.top,
+                    right: dropPos.right,
+                    minWidth: 230,
+                    background: 'var(--surface)',
+                    borderRadius: 18,
+                    border: '1.5px solid var(--border)',
+                    boxShadow: '0 20px 60px rgba(0,0,0,0.18)',
+                    zIndex: 99999,
+                    overflow: 'hidden',
+                    animation: 'navDropIn 0.18s ease both',
+                }}
+            >
+                {/* Header */}
+                <div style={{ background: 'linear-gradient(135deg,#1B4332,#2D6A4F)', padding: '13px 16px' }}>
+                    <div style={{ fontWeight: 800, color: '#FAF7F0', fontSize: 13 }}>{user?.name}</div>
+                    <div style={{ fontSize: 11, color: 'rgba(250,247,240,0.62)', marginTop: 1 }}>{user?.email}</div>
+                </div>
+                {/* Items */}
+                <div style={{ padding: '7px 6px' }}>
+                    {dropItems.map((item, i) =>
+                        item === null ? (
+                            <div key={i} style={{ height: 1, background: 'var(--border)', margin: '5px 10px' }} />
+                        ) : (
+                            <button
+                                key={i}
+                                onMouseDown={(e) => {
+                                    e.stopPropagation()
+                                    item.onClick()
+                                }}
+                                style={{
+                                    display: 'flex', alignItems: 'center', gap: 9,
+                                    width: '100%', padding: '10px 12px', border: 'none',
+                                    borderRadius: 10, background: 'none', cursor: 'pointer',
+                                    fontSize: 13, fontWeight: 600, fontFamily: 'inherit',
+                                    color: item.danger ? '#C1440E' : 'var(--dark)',
+                                    textAlign: 'left', transition: 'background 0.15s',
+                                }}
+                                onMouseEnter={e => e.currentTarget.style.background = item.danger ? 'rgba(193,68,14,0.09)' : 'rgba(45,106,79,0.08)'}
+                                onMouseLeave={e => e.currentTarget.style.background = 'none'}
+                            >
+                                <span style={{ fontSize: 16, width: 22, textAlign: 'center', flexShrink: 0 }}>{item.icon}</span>
+                                {item.label}
+                            </button>
+                        )
+                    )}
+                </div>
+            </div>
+        </>,
+        document.body
+    )
 
     return (
         <>
@@ -126,56 +213,30 @@ export default function Navbar() {
                             <>
                                 <NotificationBell animals={animals} />
 
-                                <div ref={dropRef} style={{ position: 'relative' }}>
-                                    <button onClick={() => setDropOpen(o => !o)} style={{
+                                {/* User trigger button */}
+                                <button
+                                    ref={triggerRef}
+                                    onClick={openDrop}
+                                    className="nav-user-btn"
+                                    aria-expanded={dropOpen}
+                                    style={{
                                         display: 'flex', alignItems: 'center', gap: 7,
                                         padding: '6px 12px', borderRadius: 999,
-                                        background: dropOpen ? 'rgba(45,106,79,0.16)' : 'var(--nav-user-bg)',
                                         border: '1px solid var(--nav-user-border)',
-                                        fontSize: 13, fontWeight: 700, color: 'var(--primary)',
-                                        cursor: 'pointer', fontFamily: 'inherit', transition: 'all 0.18s', maxWidth: 170,
-                                    }} aria-expanded={dropOpen}>
-                                        <span>👤</span>
-                                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{user?.name?.split(' ')[0]}</span>
-                                        <span style={{ fontSize: 9, opacity: 0.55 }}>{dropOpen ? '▲' : '▼'}</span>
-                                    </button>
+                                        fontSize: 13, fontWeight: 700,
+                                        cursor: 'pointer', fontFamily: 'inherit',
+                                        transition: 'all 0.18s', maxWidth: 170,
+                                        background: dropOpen ? 'rgba(45,106,79,0.16)' : 'var(--nav-user-bg)',
+                                        color: 'var(--primary)',
+                                    }}
+                                >
+                                    <span>👤</span>
+                                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{user?.name?.split(' ')[0]}</span>
+                                    <span style={{ fontSize: 9, opacity: 0.55 }}>{dropOpen ? '▲' : '▼'}</span>
+                                </button>
 
-                                    {dropOpen && (
-                                        <div style={{
-                                            position: 'absolute', top: 'calc(100% + 10px)', right: 0,
-                                            minWidth: 220, background: 'var(--surface)', borderRadius: 18,
-                                            border: '1.5px solid var(--border)', boxShadow: '0 20px 50px rgba(27,67,50,0.18)',
-                                            zIndex: 500, overflow: 'hidden', animation: 'fadeSlideIn 0.2s ease both',
-                                        }}>
-                                            <div style={{ background: 'linear-gradient(135deg,#1B4332,#2D6A4F)', padding: '13px 16px' }}>
-                                                <div style={{ fontWeight: 800, color: '#FAF7F0', fontSize: 13 }}>{user?.name}</div>
-                                                <div style={{ fontSize: 11, color: 'rgba(250,247,240,0.62)', marginTop: 1 }}>{user?.email}</div>
-                                            </div>
-                                            <div style={{ padding: '7px 6px' }}>
-                                                {dropItems.map((item, i) =>
-                                                    item === null ? (
-                                                        <div key={i} style={{ height: 1, background: 'var(--border)', margin: '5px 10px' }} />
-                                                    ) : (
-                                                        <button key={i} onClick={item.onClick} style={{
-                                                            display: 'flex', alignItems: 'center', gap: 9,
-                                                            width: '100%', padding: '9px 12px', border: 'none',
-                                                            borderRadius: 10, background: 'none', cursor: 'pointer',
-                                                            fontSize: 13, fontWeight: 600, fontFamily: 'inherit',
-                                                            color: item.danger ? '#C1440E' : 'var(--dark)',
-                                                            textAlign: 'left', transition: 'background 0.15s',
-                                                        }}
-                                                            onMouseEnter={e => e.currentTarget.style.background = item.danger ? 'rgba(193,68,14,0.08)' : 'rgba(45,106,79,0.07)'}
-                                                            onMouseLeave={e => e.currentTarget.style.background = 'none'}
-                                                        >
-                                                            <span style={{ fontSize: 15, width: 20, textAlign: 'center' }}>{item.icon}</span>
-                                                            {item.label}
-                                                        </button>
-                                                    )
-                                                )}
-                                            </div>
-                                        </div>
-                                    )}
-                                </div>
+                                {/* Portal dropdown (renders outside nav stacking context) */}
+                                {DropdownPortal}
                             </>
                         ) : (
                             <>
@@ -240,6 +301,24 @@ export default function Navbar() {
                     )}
                 </div>
             </div>
+
+            {/* Dropdown animation keyframe */}
+            <style>{`
+                @keyframes navDropIn {
+                    from { opacity: 0; transform: translateY(-8px) scale(0.97); }
+                    to   { opacity: 1; transform: translateY(0) scale(1); }
+                }
+                .nav-user-btn {
+                    background: var(--nav-user-bg) !important;
+                    color: var(--primary) !important;
+                    border-color: var(--nav-user-border) !important;
+                }
+                .nav:not(.scrolled) .nav-user-btn {
+                    background: rgba(250,247,240,0.13) !important;
+                    color: rgba(250,247,240,0.92) !important;
+                    border-color: rgba(250,247,240,0.28) !important;
+                }
+            `}</style>
         </>
     )
 }

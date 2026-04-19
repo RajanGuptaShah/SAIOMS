@@ -17,12 +17,14 @@ const { setupSwagger } = require('./swagger');
 const animalsRouter = require('./routes/animals');
 const breedRouter = require('./routes/breed');
 const authRouter = require('./routes/auth');
+const { router: otpRouter } = require('./routes/otp');
 const nearbyRouter = require('./routes/nearby');
 const statsRouter = require('./routes/stats');
 const geminiRouter = require('./routes/gemini');
 const chatRouter = require('./routes/chat');
 const usersRouter = require('./routes/users');
 const errorHandler = require('./middleware/errorHandler');
+
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -70,6 +72,7 @@ app.use('/api/auth', authRouter);
 app.use('/api/users', usersRouter);
 app.use('/api/animals', animalsRouter);
 app.use('/api/breed', breedRouter);
+app.use('/api/auth', otpRouter);    // OTP: send-otp, verify-otp
 app.use('/api/nearby', nearbyRouter);
 app.use('/api/stats', statsRouter);
 app.use('/api/gemini', geminiRouter);

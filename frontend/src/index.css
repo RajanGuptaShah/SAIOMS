@@ -468,13 +468,13 @@ img {
 }
 
 /* ── Fix: Hindi/Language + Dark mode toggle always visible on hero ── */
-.nav:not(.scrolled) .nav-auth button {
+.nav:not(.scrolled) .nav-auth button[aria-label] {
   border-color: rgba(250, 247, 240, 0.35) !important;
   color: rgba(250, 247, 240, 0.92) !important;
   background: rgba(250, 247, 240, 0.10) !important;
 }
 
-.nav:not(.scrolled) .nav-auth button:hover {
+.nav:not(.scrolled) .nav-auth button[aria-label]:hover {
   background: rgba(250, 247, 240, 0.18) !important;
   color: #fff !important;
   border-color: rgba(250, 247, 240, 0.55) !important;
