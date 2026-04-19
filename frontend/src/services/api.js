@@ -4,7 +4,7 @@
  */
 import axios from 'axios'
 
-const BASE = import.meta.env.VITE_API_BASE_URL || ''
+const BASE = import.meta.env.VITE_API_URL || import.meta.env.VITE_API_BASE_URL || 'https://saioms-backend.onrender.com'
 
 const api = axios.create({
     baseURL: BASE,
