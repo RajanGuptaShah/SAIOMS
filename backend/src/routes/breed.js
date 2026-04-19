@@ -13,7 +13,7 @@ const FormData = require('form-data');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
-const ML_URL = () => process.env.ML_SERVICE_URL || 'http://localhost:8001';
+const ML_URL = () => (process.env.ML_SERVICE_URL || 'http://localhost:8001').replace(/\/+$/, '');
 
 // ── POST /api/breed/detect ────────────────────────────────────────────────────
 router.post('/detect', upload.single('file'), async (req, res, next) => {
